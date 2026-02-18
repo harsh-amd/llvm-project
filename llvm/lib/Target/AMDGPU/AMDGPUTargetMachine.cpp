@@ -83,6 +83,7 @@
 #include "llvm/CodeGen/GlobalISel/Legalizer.h"
 #include "llvm/CodeGen/GlobalISel/Localizer.h"
 #include "llvm/CodeGen/GlobalISel/RegBankSelect.h"
+#include "llvm/CodeGen/LiveDebugVariables.h"
 #include "llvm/CodeGen/MIRParser/MIParser.h"
 #include "llvm/CodeGen/MachineCSE.h"
 #include "llvm/CodeGen/MachineLICM.h"
@@ -91,6 +92,7 @@
 #include "llvm/CodeGen/PostRAHazardRecognizer.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/PatternMatch.h"
@@ -375,6 +377,38 @@ static FunctionPass *createGreedyWWMRegisterAllocator() {
 static FunctionPass *createFastWWMRegisterAllocator() {
   return createFastRegisterAllocator(onlyAllocateWWMRegs, LateWaveTransform);
 }
+
+// Emit LiveDebugVariables at an explicit pipeline point before WaveTransform,
+// while VirtRegMap, LiveIntervals, and SlotIndexes are all still consistent
+// with the stashed debug data. This allows the next LiveDebugVariables run to
+// properly collect Debug data again after the WaveTransform has modified the
+// CFG.
+class AMDGPUEmitLDVPass : public MachineFunctionPass {
+public:
+  static char ID;
+  AMDGPUEmitLDVPass() : MachineFunctionPass(ID) {}
+
+  StringRef getPassName() const override {
+    return "AMDGPU Emit LiveDebugVariables";
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<LiveDebugVariablesWrapperLegacy>();
+    AU.addRequired<VirtRegMapWrapperLegacy>();
+    AU.setPreservesAll();
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    if (!MF.getFunction().getSubprogram())
+      return false;
+    auto &LDV = getAnalysis<LiveDebugVariablesWrapperLegacy>().getLDV();
+    auto &VRM = getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
+    LDV.revertCollection(&VRM);
+    return true;
+  }
+};
+char AMDGPUEmitLDVPass::ID = 0;
 
 static SGPRRegisterRegAlloc basicRegAllocSGPR(
   "basic", "basic register allocator", createBasicSGPRRegisterAllocator);
@@ -1919,6 +1953,11 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
     addPass(createVGPRAllocPass(true));
     addPreRewrite();
     addPass(createVirtRegRewriter(false));
+
+    // Emit/revert debug values now, while VRM/LIS/SlotIndexes are consistent
+    // with the LDV stashed data. WaveTransform will modify the CFG,
+    // invalidating these relationships.
+    addPass(new AMDGPUEmitLDVPass());
 
     // Perform the WaveTransform now.
     addPass(createAMDGPUWaveTransformPass());
