@@ -172,6 +172,9 @@ extern char &AMDGPUPrepareAGPRAllocLegacyID;
 void initializeAMDGPUPartitionVGPRsForRALegacyPass(PassRegistry &);
 extern char &AMDGPUPartitionVGPRsForRALegacyID;
 
+void initializeAMDGPUReEmitLiveDebugVariablesLegacyPass(PassRegistry &);
+extern char &AMDGPUReEmitLiveDebugVariablesLegacyID;
+
 void initializeAMDGPUReserveWWMRegsLegacyPass(PassRegistry &);
 extern char &AMDGPUReserveWWMRegsLegacyID;
 
