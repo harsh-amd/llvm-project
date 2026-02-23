@@ -1952,7 +1952,7 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
     // Perlane VGPR allocation pipeline.
     addPass(createVGPRAllocPass(true));
     addPreRewrite();
-    addPass(createVirtRegRewriter(false));
+    addPass(createVirtRegRewriter(false, true));
 
     // Emit/revert debug values now, while VRM/LIS/SlotIndexes are consistent
     // with the LDV stashed data. WaveTransform will modify the CFG,

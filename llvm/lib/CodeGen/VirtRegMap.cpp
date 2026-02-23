@@ -235,8 +235,10 @@ class VirtRegRewriterLegacy : public MachineFunctionPass {
 public:
   static char ID;
   bool ClearVirtRegs;
-  VirtRegRewriterLegacy(bool ClearVirtRegs = true)
-      : MachineFunctionPass(ID), ClearVirtRegs(ClearVirtRegs) {}
+  bool PreserveVRM;
+  VirtRegRewriterLegacy(bool ClearVirtRegs = true, bool PreserveVRM = false)
+      : MachineFunctionPass(ID), ClearVirtRegs(ClearVirtRegs),
+        PreserveVRM(PreserveVRM) {}
 
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 
@@ -282,7 +284,8 @@ void VirtRegRewriterLegacy::getAnalysisUsage(AnalysisUsage &AU) const {
 
   if (!ClearVirtRegs) {
     AU.addPreserved<LiveDebugVariablesWrapperLegacy>();
-    AU.addPreserved<VirtRegMapWrapperLegacy>();
+    if (PreserveVRM)
+      AU.addPreserved<VirtRegMapWrapperLegacy>();
   }
 
   MachineFunctionPass::getAnalysisUsage(AU);
@@ -781,6 +784,7 @@ void VirtRegRewriterPass::printPipeline(
     OS << "<no-clear-vregs>";
 }
 
-FunctionPass *llvm::createVirtRegRewriter(bool ClearVirtRegs) {
-  return new VirtRegRewriterLegacy(ClearVirtRegs);
+FunctionPass *llvm::createVirtRegRewriter(bool ClearVirtRegs,
+                                          bool PreserveVRM) {
+  return new VirtRegRewriterLegacy(ClearVirtRegs, PreserveVRM);
 }
