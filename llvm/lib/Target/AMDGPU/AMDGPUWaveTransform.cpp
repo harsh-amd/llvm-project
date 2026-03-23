@@ -1631,9 +1631,8 @@ private:
 
     // initialized to opcode for implicit conditional branches :
     // S_CBRANCH_EXECZ S_CBRANCH_EXECNZ S_CBRANCH_VCCZ S_CBRANCH_VCCNZ
-    // S_CBRANCH_SCC0 S_CBRANCH_SCC1
-    // All active threads branch on some implicit condition for the above
-    // opcodes.
+    // S_CBRANCH_SCC0 S_CBRANCH_SCC1 -- all active threads branch uniformly.
+    // INLINEASM_BR -- opaque callbr; exec assumed invariant.
     unsigned ImplicitBranchOpc = 0;
 
     explicit CFGNodeInfo(WaveNode *Node) : Node(Node) {}
@@ -1721,11 +1720,16 @@ void ControlFlowRewriter::prepareWaveCfg() {
 
     bool ZVariant = false;
     // Detect INLINEASM_BR instructions in the block.
-    Info.HasInlineAsmBr = llvm::any_of(
-        make_range(Node->Block->begin(), Node->Block->getFirstTerminator()),
-        [](const MachineInstr &MI) {
-          return MI.getOpcode() == TargetOpcode::INLINEASM_BR;
-        });
+    // INLINEASM_BR is opaque; exec is assumed invariant across callbr.
+    // Treated as uniform.
+    if (Node->Block->mayHaveInlineAsmBr()) {
+      for (const MachineInstr &MI : *Node->Block) {
+        if (MI.getOpcode() == TargetOpcode::INLINEASM_BR) {
+          Info.ImplicitBranchOpc = TargetOpcode::INLINEASM_BR;
+          break;
+        }
+      }
+    }
 
     // Analyze original terminators.
     for (MachineInstr &Terminator : Node->Block->terminators()) {
@@ -1784,11 +1788,17 @@ void ControlFlowRewriter::prepareWaveCfg() {
            "TODO: exit unification");
     assert((!Info.ImplicitBranchOpc || !Info.OrigCondition) &&
            "ImplicitBranchOpc and OrigCondition are mutually exclusive");
-    assert((!Info.ImplicitBranchOpc || Info.OrigSuccCond) &&
+    assert((!Info.ImplicitBranchOpc || Info.OrigSuccCond ||
+            Info.ImplicitBranchOpc == TargetOpcode::INLINEASM_BR) &&
            "Implicit conditional branch requires OrigSuccCond");
 
     // Record information for reconstructing lane masks.
-    if (!Info.OrigSuccCond) {
+    if (Info.ImplicitBranchOpc == TargetOpcode::INLINEASM_BR) {
+      // All successors receive unconditional full-EXEC lane contributions.
+      for (WaveNode *Succ : Node->Successors) {
+        NodeInfo.find(Succ)->second.origins.emplace_back(Node);
+      }
+    } else if (!Info.OrigSuccCond) {
       if (Info.OrigSuccFinal) {
         NodeInfo.find(Info.OrigSuccFinal)->second.origins.emplace_back(Node);
       }
@@ -1913,6 +1923,10 @@ void ControlFlowRewriter::rewrite() {
   for (WaveNode *Node : NodeOrder) {
     CFGNodeInfo &Info = NodeInfo.find(Node)->second;
     MachineBasicBlock::iterator MBBINodeEnd = Node->Block->end();
+
+    // INLINEASM_BR: opaque callbr with exec assumed invariant. Skip rewrite.
+    if (Info.ImplicitBranchOpc == TargetOpcode::INLINEASM_BR)
+      continue;
 
     if (!Info.OrigExit) {
       // Remove original terminators.
