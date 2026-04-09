@@ -1,4 +1,4 @@
-// REQUIRES: comgr-has-spirv
+// REQUIRES: comgr-has-spirv-translator
 
 // COM: Test not supported on amd-main
 // XFAIL: *
