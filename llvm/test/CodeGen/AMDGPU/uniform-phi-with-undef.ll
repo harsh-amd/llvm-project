@@ -14,7 +14,6 @@ define amdgpu_ps float @uniform_phi_with_undef(float inreg %c, float %v, i32 %x,
 ; GCN-NEXT:    v_cmp_ge_i32_e64 s1, v2, v1
 ; GCN-NEXT:    s_xor_b32 s3, s1, exec_lo
 ; GCN-NEXT:    s_xor_b32 s2, exec_lo, s3
-; GCN-NEXT:    s_mov_b32 s4, 0
 ; GCN-NEXT:    s_mov_b32 exec_lo, s3
 ; GCN-NEXT:    ; divergent control-flow edge
 ; GCN-NEXT:    s_cbranch_execz .LBB0_1
