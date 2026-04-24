@@ -214,6 +214,9 @@ static const MnemonicMapping kVALURenames[] = {
     {"v_and_b16", "v_and_b32"},
     {"v_or_b16", "v_or_b32"},
     {"v_cndmask_b16", "v_cndmask_b32"},
+    {"v_mov_b16", "v_mov_b32"},
+    {"v_add_f16_e32", "v_add_f16"},
+    {"v_mul_f16_e32", "v_mul_f16"},
 };
 
 static const MnemonicMapping kGlobalAtomicRenames[] = {
