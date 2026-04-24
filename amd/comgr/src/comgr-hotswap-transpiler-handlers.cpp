@@ -307,6 +307,29 @@ static TranslationResult HandleSALUFloat(
     }
   }
 
+  // Unary SALU float → VALU emulation (s_trunc_f32, s_ceil_f32, s_floor_f32, etc.)
+  {
+    static const std::unordered_map<std::string, std::string> kSaluUnaryFloatMap = {
+        {"s_trunc_f32", "v_trunc_f32_e32"},
+        {"s_ceil_f32", "v_ceil_f32_e32"},
+        {"s_floor_f32", "v_floor_f32_e32"},
+        {"s_rndne_f32", "v_rndne_f32_e32"},
+        {"s_cvt_f32_i32", "v_cvt_f32_i32_e32"},
+        {"s_cvt_f32_u32", "v_cvt_f32_u32_e32"},
+        {"s_cvt_i32_f32", "v_cvt_i32_f32_e32"},
+        {"s_cvt_u32_f32", "v_cvt_u32_f32_e32"},
+    };
+    auto su_it = kSaluUnaryFloatMap.find(mnemonic);
+    if (su_it != kSaluUnaryFloatMap.end()) {
+      auto operands = ParseOperandList(line, mnemonic);
+      if (operands.size() >= 2)
+        return std::vector<std::string>{
+          su_it->second + " " + vtemp + ", " + operands[1],
+          "v_readfirstlane_b32 " + operands[0] + ", " + vtemp
+        };
+    }
+  }
+
   // v_s_sqrt_f32
   if (mnemonic == "v_s_sqrt_f32") {
     auto operands = ParseOperandList(line, mnemonic);
@@ -315,6 +338,25 @@ static TranslationResult HandleSALUFloat(
         "v_sqrt_f32_e32 " + vtemp + ", " + operands[1],
         "v_readfirstlane_b32 " + operands[0] + ", " + vtemp
       };
+  }
+
+  // v_s_rcp_f32, v_s_rsq_f32, v_s_log_f32, v_s_exp_f32 — GFX12 scalar-in-vector
+  {
+    static const std::unordered_map<std::string, std::string> kVSMap = {
+        {"v_s_rcp_f32", "v_rcp_f32_e32"},
+        {"v_s_rsq_f32", "v_rsq_f32_e32"},
+        {"v_s_log_f32", "v_log_f32_e32"},
+        {"v_s_exp_f32", "v_exp_f32_e32"},
+    };
+    auto vs_it = kVSMap.find(mnemonic);
+    if (vs_it != kVSMap.end()) {
+      auto operands = ParseOperandList(line, mnemonic);
+      if (operands.size() >= 2)
+        return std::vector<std::string>{
+          vs_it->second + " " + vtemp + ", " + operands[1],
+          "v_readfirstlane_b32 " + operands[0] + ", " + vtemp
+        };
+    }
   }
 
   // s_cmp_*_f32
@@ -915,11 +957,16 @@ static TranslationResult HandleExecOperation(
   (void)scale_temp_vgpr;
   (void)cmpx_temp_sgpr;
   (void)compact_mode;
-  // v_div_scale_f32 null sdst → vcc
-  if (mnemonic == "v_div_scale_f32") {
-    size_t null_pos = line.find(", null,");
-    if (null_pos != std::string::npos)
-      line.replace(null_pos, 7, ", vcc,");
+  // v_div_scale_f32/f64: GFX12 allows arbitrary SGPR as sdst, GFX9 requires VCC
+  if (mnemonic == "v_div_scale_f32" || mnemonic == "v_div_scale_f64") {
+    auto operands = ParseOperandList(line, mnemonic);
+    // Format: vdst, sdst, src0, src1, src2
+    if (operands.size() >= 5 && operands[1] != "vcc") {
+      operands[1] = "vcc";
+      line = mnemonic + " " + operands[0];
+      for (size_t i = 1; i < operands.size(); ++i)
+        line += ", " + operands[i];
+    }
   }
   return std::nullopt;
 }
@@ -1113,6 +1160,12 @@ std::vector<std::string> TranslateInstruction(const std::string& asm_line,
 
   std::string mnemonic = TranspileExtractMnemonic(line);
 
+  // v_illegal: undecodable instructions from the disassembler → NOP
+  if (mnemonic == "v_illegal") {
+    result.push_back("s_nop 0");
+    return result;
+  }
+
   // GFX12 _nc_ VALU → remove _nc_
   if (mnemonic.find("_nc_") != std::string::npos && mnemonic[0] == 'v') {
     std::string fixed = mnemonic;
@@ -1122,6 +1175,22 @@ std::vector<std::string> TranslateInstruction(const std::string& asm_line,
       fixed += "_e32";
     line = TranspileReplaceMnemonic(line, mnemonic, fixed);
     mnemonic = fixed;
+  }
+
+  // v_fmac → v_fma: accumulate form (dst = src0 * src1 + dst) → explicit 3-src
+  // Handles both f32 and f16 variants. GFX9 doesn't have v_fmac_f16.
+  if (mnemonic == "v_fmac_f32_e32" || mnemonic == "v_fmac_f32" ||
+      mnemonic == "v_fmac_f16_e32" || mnemonic == "v_fmac_f16" ||
+      mnemonic == "v_fmac_f32_e64" || mnemonic == "v_fmac_f16_e64") {
+    auto operands = ParseOperandList(line, mnemonic);
+    if (operands.size() >= 3) {
+      // v_fmac dst, src0, src1 → v_fma dst, src0, src1, dst
+      std::string suffix = mnemonic.find("f16") != std::string::npos ? "f16" : "f32";
+      std::string fma_mn = "v_fma_" + suffix;
+      line = fma_mn + " " + operands[0] + ", " + operands[1] + ", " +
+             operands[2] + ", " + operands[0];
+      mnemonic = fma_mn;
+    }
   }
 
   // GFX12 s_and_not1/s_or_not1 → s_andn2/s_orn2

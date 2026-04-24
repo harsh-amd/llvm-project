@@ -165,6 +165,13 @@ std::vector<std::string> WidenExecOperation(const std::string& line, bool compac
         if (dst[0] == 's' && dst.size() > 1 && std::isdigit(dst[1])) {
           std::string src32 = src;
           if (src32 == "vcc") src32 = "vcc_lo";
+          // If src was widened to a pair (s[N:N+1]), use only the low half
+          if (src32.find("s[") != std::string::npos) {
+            size_t bracket = src32.find('[');
+            size_t colon = src32.find(':');
+            if (bracket != std::string::npos && colon != std::string::npos)
+              src32 = "s" + src32.substr(bracket + 1, colon - bracket - 1);
+          }
           result.push_back("s_mov_b32 " + dst + ", exec_lo");
           bool is_or = (b64_mnem.find("s_or_saveexec") == 0);
           if (is_or)

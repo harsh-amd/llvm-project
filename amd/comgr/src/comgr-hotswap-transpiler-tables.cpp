@@ -209,6 +209,11 @@ static const MnemonicMapping kVALURenames[] = {
     {"v_sub_co_ci_u32", "v_subb_co_u32"},
     {"v_cvt_pk_f16_f32", "v_cvt_pkrtz_f16_f32"},
     {"v_lshlrev_b64", "v_lshlrev_b64"},
+    // GFX12 16-bit ops → GFX9 32-bit equivalents
+    {"v_xor_b16", "v_xor_b32"},
+    {"v_and_b16", "v_and_b32"},
+    {"v_or_b16", "v_or_b32"},
+    {"v_cndmask_b16", "v_cndmask_b32"},
 };
 
 static const MnemonicMapping kGlobalAtomicRenames[] = {
