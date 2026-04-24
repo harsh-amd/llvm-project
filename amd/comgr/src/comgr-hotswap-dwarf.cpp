@@ -8,6 +8,17 @@
 
 #include "comgr-hotswap-internal.h"
 
+#include "llvm/Support/LEB128.h"
+#include <sstream>
+
+using COMGR::hotswap::Trampoline;
+
+struct DebugLineRow {
+  uint64_t address;
+  uint32_t file;
+  int32_t line;
+};
+
 // ── LEB128 helpers (file-local) ──────────────────────────────────────────────
 
 static void EncodeSLEB128(int64_t value, std::vector<uint8_t> &out) {
@@ -105,7 +116,7 @@ uint8_t *FindSectionHeader(uint8_t *elf, size_t elf_size,
 
   for (auto &t : trampolines) {
     std::ostringstream oss;
-    oss << "__hotswap_tramp_" << std::hex << t.original_offset;
+    oss << "__hotswap_tramp_" << std::hex << t.OriginalOffset;
     names.push_back(oss.str());
 
     std::vector<uint8_t> entry(24, 0);
@@ -113,10 +124,10 @@ uint8_t *FindSectionHeader(uint8_t *elf, size_t elf_size,
     uint16_t shndx = static_cast<uint16_t>(text_section_idx);
     std::memcpy(entry.data() + 6, &shndx, 2);
     std::memcpy(entry.data() + 8, &running, 8);
-    uint64_t sz = t.bytes.size();
+    uint64_t sz = t.Bytes.size();
     std::memcpy(entry.data() + 16, &sz, 8);
     entries.push_back(std::move(entry));
-    running += t.bytes.size();
+    running += t.Bytes.size();
   }
 
   size_t extra_str = 0;
@@ -320,8 +331,8 @@ static std::vector<DebugLineRow> ScanDebugLineTable(
   uint64_t running = text_size_before;
   for (auto &t : trampolines) {
     uint64_t tramp_addr = text_addr + running;
-    uint64_t tramp_end = tramp_addr + t.bytes.size();
-    int32_t src_line = FindLine(t.original_offset);
+    uint64_t tramp_end = tramp_addr + t.Bytes.size();
+    int32_t src_line = FindLine(t.OriginalOffset);
 
     extra.push_back(0x00); extra.push_back(0x09); extra.push_back(0x02);
     for (int b = 0; b < 8; ++b)
@@ -340,7 +351,7 @@ static std::vector<DebugLineRow> ScanDebugLineTable(
 
     extra.push_back(0x00); extra.push_back(0x01); extra.push_back(0x01);
 
-    running += t.bytes.size();
+    running += t.Bytes.size();
   }
 
   if (extra.empty()) return true;

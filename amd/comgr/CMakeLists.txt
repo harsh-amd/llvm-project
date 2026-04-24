@@ -78,8 +78,15 @@ set(SOURCES
   src/comgr-env.cpp
   src/comgr-hotswap.cpp
   src/comgr-hotswap-b0a0.cpp
+  src/comgr-hotswap-dwarf.cpp
   src/comgr-hotswap-elf.cpp
+  src/comgr-hotswap-liveness.cpp
   src/comgr-hotswap-llvm.cpp
+  src/comgr-hotswap-opcode-map.cpp
+  src/comgr-hotswap-transpiler.cpp
+  src/comgr-hotswap-transpiler-handlers.cpp
+  src/comgr-hotswap-transpiler-helpers.cpp
+  src/comgr-hotswap-transpiler-tables.cpp
   src/comgr-libcxx-headers.cpp
   src/comgr-metadata.cpp
   src/comgr-signal.cpp
@@ -165,7 +172,12 @@ endif()
 
 target_include_directories(amd_comgr
   PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  # AMDGPU-internal headers (SIDefines.h, AMDGPUBaseInfo.h) needed by
+  # the hotswap transpiler pipeline for opcode mapping and TSFlag queries.
+  ${LLVM_MAIN_SRC_DIR}/lib/Target/AMDGPU
+  ${LLVM_MAIN_SRC_DIR}/lib/Target/AMDGPU/Utils
+  ${CMAKE_BINARY_DIR}/lib/Target/AMDGPU)
 
 message("")
 message("------------LLVM_DIR: ${LLVM_DIR}")

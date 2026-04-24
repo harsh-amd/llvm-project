@@ -25,12 +25,20 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_rewrite(
       parseTargetIdentifier(target_isa_name, TargetIdent))
     return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
 
-  if (SourceIdent.Processor != "gfx1250" || TargetIdent.Processor != "gfx1250")
+  if (SourceIdent.Processor != "gfx1250")
     return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
 
   std::unique_ptr<llvm::MemoryBuffer> OutBuffer;
-  amd_comgr_status_t Status = hotswap::retargetCodeObjectB0A0(
-      InputP->Data, InputP->Size, TargetIdent, OutBuffer);
+  amd_comgr_status_t Status;
+  if (TargetIdent.Processor == "gfx1250") {
+    Status = hotswap::retargetCodeObjectB0A0(InputP->Data, InputP->Size,
+                                             TargetIdent, OutBuffer);
+  } else if (hotswap::isGfx9Target(TargetIdent.Processor)) {
+    Status = hotswap::retargetCodeObjectTranspile(
+        InputP->Data, InputP->Size, SourceIdent, TargetIdent, OutBuffer);
+  } else {
+    return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
+  }
   if (Status != AMD_COMGR_STATUS_SUCCESS)
     return Status;
   if (!OutBuffer)

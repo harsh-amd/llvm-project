@@ -23,10 +23,14 @@
 #include "comgr-env.h"
 #include "comgr.h"
 
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -54,7 +58,14 @@
 #include "llvm/Support/AMDHSAKernelDescriptor.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/MC/MCAsmBackend.h"
+#include "llvm/MC/MCObjectWriter.h"
+#include "llvm/MC/MCParser/MCAsmParser.h"
+#include "llvm/MC/MCParser/MCTargetAsmParser.h"
+#include "llvm/MC/MCStreamer.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include "SIDefines.h"
 
 namespace COMGR {
 namespace hotswap {
@@ -493,7 +504,361 @@ retargetCodeObjectB0A0(const void *ElfData, size_t ElfSize,
                        const TargetIdentifier &TargetIdent,
                        std::unique_ptr<llvm::MemoryBuffer> &Out);
 
+/// Run the full gfx1250->gfx9 cross-family transpilation pipeline on
+/// \p ElfData / \p ElfSize. \p SourceIdent and \p TargetIdent are the parsed
+/// source and target ISAs. On success \p Out is populated with an owned
+/// buffer containing the transpiled code object.
+amd_comgr_status_t
+retargetCodeObjectTranspile(const void *ElfData, size_t ElfSize,
+                            const TargetIdentifier &SourceIdent,
+                            const TargetIdentifier &TargetIdent,
+                            std::unique_ptr<llvm::MemoryBuffer> &Out);
+
 } // namespace hotswap
 } // namespace COMGR
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Transpiler-specific types (file scope)
+//
+// These types are used by the gfx1250→gfx9 cross-family transpiler pipeline
+// (comgr-hotswap-transpiler*.cpp). They live at file scope (not inside
+// COMGR::hotswap) because the transpiler code was developed as a standalone
+// pipeline. The B0→A0 types above (in COMGR::hotswap) use PascalCase field
+// names; these use snake_case.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#include <iostream>
+#include <unordered_map>
+
+// ── MallocBuffer RAII wrapper ────────────────────────────────────────────────
+
+struct MallocBuffer {
+  uint8_t *data = nullptr;
+  size_t size = 0;
+
+  MallocBuffer() = default;
+  MallocBuffer(size_t n)
+      : data(static_cast<uint8_t *>(std::malloc(n))), size(n) {}
+  ~MallocBuffer() { std::free(data); }
+
+  MallocBuffer(MallocBuffer &&o) noexcept : data(o.data), size(o.size) {
+    o.data = nullptr;
+    o.size = 0;
+  }
+  MallocBuffer &operator=(MallocBuffer &&o) noexcept {
+    if (this != &o) {
+      std::free(data);
+      data = o.data;
+      size = o.size;
+      o.data = nullptr;
+      o.size = 0;
+    }
+    return *this;
+  }
+
+  MallocBuffer(const MallocBuffer &) = delete;
+  MallocBuffer &operator=(const MallocBuffer &) = delete;
+
+  explicit operator bool() const { return data != nullptr; }
+  uint8_t *release() {
+    uint8_t *p = data;
+    data = nullptr;
+    size = 0;
+    return p;
+  }
+};
+
+// ── Logging ──────────────────────────────────────────────────────────────────
+
+enum class HotswapLogLevel : int { Silent = 0, Error = 1, Info = 2, Debug = 3 };
+
+inline HotswapLogLevel GetHotswapLogLevel() {
+  static HotswapLogLevel level = []() {
+    const char *env = std::getenv("HSA_HOTSWAP_LOG_LEVEL");
+    if (env) {
+      int v = std::atoi(env);
+      if (v >= 0 && v <= 3)
+        return static_cast<HotswapLogLevel>(v);
+    }
+    return HotswapLogLevel::Info;
+  }();
+  return level;
+}
+
+inline std::ostream &HotswapLog(HotswapLogLevel level) {
+  static std::ostream null_stream(nullptr);
+  if (static_cast<int>(level) <= static_cast<int>(GetHotswapLogLevel()))
+    return std::cerr;
+  return null_stream;
+}
+
+// ── ELF types (transpiler) ───────────────────────────────────────────────────
+
+struct ElfSection {
+  uint32_t name_idx;
+  std::string name;
+  uint32_t type;
+  uint64_t offset;
+  uint64_t size;
+  uint64_t addr;
+};
+
+struct ElfSymbol {
+  std::string name;
+  uint64_t value;
+  uint64_t size;
+  uint8_t info;
+  uint16_t shndx;
+};
+
+struct ElfInfo {
+  std::vector<ElfSection> sections;
+  std::vector<ElfSymbol> symbols;
+  int text_section_idx = -1;
+  int text_idx = -1;
+  uint64_t text_offset = 0;
+  uint64_t text_size = 0;
+  uint64_t text_addr = 0;
+};
+
+// ── Transpile result type (placeholder) ──────────────────────────────────────
+
+struct amd_comgr_hotswap_result_t {
+  uint32_t patches_applied = 0;
+  uint32_t trampolines_created = 0;
+  uint32_t rules_matched = 0;
+};
+
+// ── Transpile mapping types ──────────────────────────────────────────────────
+
+struct TranspileMappingEntry {
+  uint64_t src_offset;
+  std::string src_mnemonic;
+  uint32_t src_size;
+  std::string kind;
+  uint32_t tgt_count;
+  std::vector<uint64_t> tgt_offsets;
+};
+
+struct TranspileMapping {
+  std::string source_isa;
+  std::string target_isa;
+  std::string kernel;
+  std::vector<TranspileMappingEntry> entries;
+
+  void emitJSON(const std::string &path) const;
+};
+
+struct TranspileStats {
+  uint32_t total_instructions = 0;
+  uint32_t translated_passthrough = 0;
+  uint32_t translated_renamed = 0;
+  uint32_t translated_waitcnt = 0;
+  uint32_t translated_exec = 0;
+  uint32_t unsupported_skipped = 0;
+};
+
+using TranslationResult = std::optional<std::vector<std::string>>;
+
+// ── Transpiler function declarations ─────────────────────────────────────────
+
+std::string ExtractCPU(const std::string &isa_name);
+[[nodiscard]] bool ParseElfInfo(const uint8_t *elf, size_t elf_size,
+                                ElfInfo &info);
+std::string FindKernelAtOffset(const ElfInfo &elf_info, uint64_t text_offset);
+
+// ── Transpiler LLVM helpers (separate from COMGR::hotswap::LLVMState) ────────
+//
+// The transpiler uses its own LLVMState type at file scope. Because the
+// transpiler .cpp files are not inside namespace COMGR::hotswap, there is
+// no collision with COMGR::hotswap::LLVMState.
+
+struct LLVMState {
+  const llvm::Target *target = nullptr;
+  std::unique_ptr<llvm::MCRegisterInfo> MRI;
+  std::unique_ptr<const llvm::MCAsmInfo> MAI;
+  std::unique_ptr<llvm::MCInstrInfo> MCII;
+  std::unique_ptr<llvm::MCSubtargetInfo> STI;
+  std::unique_ptr<llvm::MCContext> Ctx;
+  std::unique_ptr<llvm::MCObjectFileInfo> MOFI;
+  std::unique_ptr<llvm::MCDisassembler> disasm;
+  std::unique_ptr<llvm::MCInstPrinter> printer;
+  llvm::MCCodeEmitter *CE = nullptr;
+  std::string cpu;
+  bool valid = false;
+};
+
+LLVMState InitLLVMImpl(const std::string &isa_name,
+                        const llvm::Target *cached_target = nullptr);
+LLVMState InitLLVMCached(const std::string &isa_name);
+
+// ── Transpiler decoded-instruction and analysis types ────────────────────────
+//
+// File-scope counterparts of the COMGR::hotswap types, using snake_case field
+// names to match the transpiler convention. These are separate types — not
+// aliases — used exclusively by the transpiler pipeline.
+
+struct InternalDecodedInst {
+  uint64_t offset = 0;
+  uint32_t size = 0;
+  llvm::MCInst inst;
+  std::string mnemonic;
+};
+
+struct RegDefUse {
+  llvm::BitVector defs{256};
+  llvm::BitVector uses{256};
+};
+
+struct BasicBlock {
+  uint64_t start_offset = 0;
+  uint64_t end_offset = 0;
+  std::vector<size_t> inst_indices;
+  std::vector<int> successors;
+  std::vector<int> predecessors;
+};
+
+struct CFG {
+  std::vector<BasicBlock> blocks;
+  std::unordered_map<uint64_t, int> offset_to_block;
+};
+
+struct LivenessInfo {
+  std::vector<llvm::BitVector> live_before;
+  std::vector<llvm::BitVector> live_after;
+  bool converged = false;
+};
+
+struct ScratchPatchInfo {
+  uint64_t offset;
+  llvm::BitVector scratch_regs{256};
+};
+
+// ── Transpiler opcode mapping ────────────────────────────────────────────────
+
+unsigned GetEncodingFamily(const std::string &cpu);
+
+struct OpcodeMapper {
+  std::unordered_map<unsigned, unsigned> real_to_pseudo;
+  unsigned src_gen = 0;
+  bool initialized = false;
+
+  void init(unsigned src_gen, const llvm::MCInstrInfo &MCII);
+  unsigned toPseudo(unsigned real_opcode) const;
+  static unsigned toTarget(unsigned pseudo_opcode, unsigned tgt_gen);
+};
+
+OpcodeMapper &GetOpcodeMapper(unsigned src_gen,
+                              const llvm::MCInstrInfo &MCII);
+
+// ── Transpiler LLVM / liveness functions ─────────────────────────────────────
+
+RegDefUse GetInstRegDefUse(const llvm::MCInst &inst,
+                           const llvm::MCInstrInfo &MCII,
+                           const llvm::MCRegisterInfo &MRI);
+int64_t GetBranchImm(const llvm::MCInst &inst);
+CFG BuildCFG(const std::vector<InternalDecodedInst> &decoded,
+             const llvm::MCInstrInfo &MCII);
+LivenessInfo ComputeLiveness(const std::vector<InternalDecodedInst> &decoded,
+                             const CFG &cfg, const llvm::MCInstrInfo &MCII,
+                             const llvm::MCRegisterInfo &MRI);
+int GetKernelVgprCount(const uint8_t *elf_data, size_t elf_size,
+                       const ElfInfo &elf_info,
+                       const std::string &kernel_name);
+[[nodiscard]] bool VerifyPatchCorrectness(
+    const uint8_t *text, uint64_t text_size, const LLVMState &llvm_state,
+    const std::vector<ScratchPatchInfo> &scratch_patches);
+[[nodiscard]] bool DecodeTextSection(const uint8_t *text, uint64_t text_size,
+                                     const LLVMState &llvm_state,
+                                     std::vector<InternalDecodedInst> &decoded);
+int GetVgprNum(unsigned reg, const llvm::MCRegisterInfo &MRI);
+std::pair<int, int> GetVgprRange(unsigned reg,
+                                 const llvm::MCRegisterInfo &MRI);
+
+// ── Transpiler constants ─────────────────────────────────────────────────────
+
+static constexpr uint32_t KD_RSRC1_VGPR_MASK  = 0x3Fu;
+static constexpr uint32_t KD_RSRC1_SGPR_SHIFT = 6;
+static constexpr uint32_t KD_RSRC1_SGPR_MASK  = 0xFu;
+
+// ── Transpiler mnemonic mapping type ─────────────────────────────────────────
+
+struct MnemonicMapping {
+  const char *gfx12;
+  const char *gfx9;
+};
+
+// ── Transpiler taint / register analysis types ───────────────────────────────
+
+enum class RegKind { SGPR, VGPR, TTMP, SCC, VCC, EXEC, Other };
+
+enum class TaintAction { Keep, Skip, Replace };
+
+struct TaintResult {
+  TaintAction action;
+  std::string replace_dst;
+  std::string replace_src;
+};
+
+struct SourceInstrForTaint {
+  std::string text;
+  llvm::MCInst inst;
+  bool valid_inst;
+};
+
+// ── Transpiler tables ────────────────────────────────────────────────────────
+
+bool NeedsTranspileImpl(const std::string &source_isa,
+                        const std::string &target_isa);
+const std::unordered_map<std::string, std::string> &GetMnemonicMap();
+
+// ── Transpiler helpers ───────────────────────────────────────────────────────
+
+bool WritesExecLo(const std::string &line);
+bool IsWaitInstruction(const std::string &mnemonic);
+std::string TranslateWaitInstruction(const std::string &line);
+bool IsUnsupportedOnGFX9(const std::string &mnemonic);
+std::string WidenVccReferences(const std::string &line);
+std::vector<std::string> WidenExecOperation(const std::string &line,
+                                            bool compact_mode = false);
+std::string TranslateOperandSyntax(const std::string &line,
+                                   const std::string &target_cpu);
+std::string TranspileExtractMnemonic(const std::string &line);
+std::string TranspileReplaceMnemonic(const std::string &line,
+                                     const std::string &old_mnemonic,
+                                     const std::string &new_mnemonic);
+RegKind ClassifyReg(unsigned reg, const llvm::MCRegisterInfo &MRI);
+bool IsRegTainted(unsigned reg, const std::set<unsigned> &tainted,
+                  const llvm::MCRegisterInfo &MRI);
+void TaintReg(unsigned reg, std::set<unsigned> &tainted,
+              const llvm::MCRegisterInfo &MRI);
+void UntaintReg(unsigned reg, std::set<unsigned> &tainted,
+                const llvm::MCRegisterInfo &MRI);
+void GetInstRegs(const llvm::MCInst &inst, const llvm::MCInstrInfo &MCII,
+                 const llvm::MCRegisterInfo &MRI,
+                 std::vector<unsigned> &defs, std::vector<unsigned> &uses);
+std::vector<TaintResult> AnalyzeTTMPTaint(
+    const std::vector<SourceInstrForTaint> &instrs,
+    const llvm::MCInstrInfo &MCII, const llvm::MCRegisterInfo &MRI);
+std::vector<std::string> ParseOperandList(const std::string &line,
+                                          const std::string &mnemonic);
+std::vector<std::string> TranslateInstruction(
+    const std::string &asm_line, const std::string &source_cpu,
+    const std::string &target_cpu, int scale_temp_vgpr = 7,
+    int cmpx_temp_sgpr = 16, bool compact_mode = false,
+    unsigned opcode = ~0u, const llvm::MCInstrInfo *MCII = nullptr);
+
+// ── Transpiler DWARF helpers ─────────────────────────────────────────────────
+
+uint8_t *FindSectionHeader(uint8_t *elf, size_t elf_size, const char *name,
+                           int *out_idx = nullptr);
+
+// ── Transpiler entry point ───────────────────────────────────────────────────
+
+amd_comgr_status_t
+TranspileCodeObject(const void *elf_data, size_t elf_size,
+                    const std::string &source_isa,
+                    const std::string &target_isa, void **out_data,
+                    size_t *out_size, amd_comgr_hotswap_result_t *result);
 
 #endif // COMGR_HOTSWAP_INTERNAL_H

@@ -6,14 +6,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "comgr-hotswap-internal.h"
+#include "AMDGPUBaseInfo.h"
 
 using namespace llvm;
 
-void OpcodeMapper::init(unsigned src_gen) {
-  for (unsigned pseudo = 0; pseudo < AMDGPU::INSTRUCTION_LIST_END; ++pseudo) {
+void OpcodeMapper::init(unsigned src_gen, const llvm::MCInstrInfo &MCII) {
+  unsigned num_opcodes = MCII.getNumOpcodes();
+  for (unsigned pseudo = 0; pseudo < num_opcodes; ++pseudo) {
     int32_t real = AMDGPU::getMCOpcode(pseudo, src_gen);
-    if (real != -1 &&
-        real != static_cast<int32_t>(AMDGPU::INSTRUCTION_LIST_END)) {
+    if (real != -1 && real < static_cast<int32_t>(num_opcodes)) {
       real_to_pseudo[static_cast<unsigned>(real)] = pseudo;
     }
   }
@@ -28,8 +29,7 @@ unsigned OpcodeMapper::toPseudo(unsigned real_opcode) const {
 
 unsigned OpcodeMapper::toTarget(unsigned pseudo_opcode, unsigned tgt_gen) {
   int32_t real = AMDGPU::getMCOpcode(pseudo_opcode, tgt_gen);
-  if (real == -1 ||
-      real == static_cast<int32_t>(AMDGPU::INSTRUCTION_LIST_END))
+  if (real == -1)
     return static_cast<unsigned>(-1);
   return static_cast<unsigned>(real);
 }
@@ -47,11 +47,12 @@ unsigned GetEncodingFamily(const std::string &cpu) {
 static std::mutex g_mapper_mutex;
 static std::unordered_map<unsigned, OpcodeMapper> g_mappers;
 
-OpcodeMapper &GetOpcodeMapper(unsigned src_gen) {
+OpcodeMapper &GetOpcodeMapper(unsigned src_gen,
+                              const llvm::MCInstrInfo &MCII) {
   std::lock_guard<std::mutex> lock(g_mapper_mutex);
   auto it = g_mappers.find(src_gen);
   if (it != g_mappers.end())
     return it->second;
-  g_mappers[src_gen].init(src_gen);
+  g_mappers[src_gen].init(src_gen, MCII);
   return g_mappers[src_gen];
 }

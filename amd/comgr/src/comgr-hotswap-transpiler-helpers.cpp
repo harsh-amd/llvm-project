@@ -545,3 +545,287 @@ std::vector<std::string> ParseOperandList(const std::string& line,
   return operands;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ELF utility functions (transpiler pipeline)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+std::string ExtractCPU(const std::string &isa_name) {
+  size_t pos = isa_name.rfind("gfx");
+  if (pos != std::string::npos) {
+    std::string cpu;
+    for (size_t i = pos; i < isa_name.size(); ++i) {
+      char c = isa_name[i];
+      if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+          (c >= 'A' && c <= 'Z'))
+        cpu += c;
+      else
+        break;
+    }
+    return cpu;
+  }
+  return "";
+}
+
+[[nodiscard]] bool ParseElfInfo(const uint8_t *elf, size_t elf_size,
+                                ElfInfo &info) {
+  using ELFT = llvm::object::ELF64LE;
+  auto elf_or_err = llvm::object::ELFFile<ELFT>::create(
+      llvm::StringRef(reinterpret_cast<const char *>(elf), elf_size));
+  if (!elf_or_err) {
+    llvm::consumeError(elf_or_err.takeError());
+    return false;
+  }
+  const auto &elf_file = *elf_or_err;
+
+  auto sections_or_err = elf_file.sections();
+  if (!sections_or_err) {
+    llvm::consumeError(sections_or_err.takeError());
+    return false;
+  }
+  auto shdrs = *sections_or_err;
+
+  for (const auto &shdr : shdrs) {
+    ElfSection sec;
+    sec.type = shdr.sh_type;
+    sec.offset = shdr.sh_offset;
+    sec.size = shdr.sh_size;
+    sec.addr = shdr.sh_addr;
+    sec.name_idx = shdr.sh_name;
+
+    auto name_or_err = elf_file.getSectionName(shdr);
+    if (name_or_err)
+      sec.name = name_or_err->str();
+    else
+      llvm::consumeError(name_or_err.takeError());
+
+    if (sec.name == ".text" && sec.offset + sec.size <= elf_size) {
+      info.text_section_idx = static_cast<int>(info.sections.size());
+      info.text_idx = info.text_section_idx;
+      info.text_offset = sec.offset;
+      info.text_size = sec.size;
+      info.text_addr = sec.addr;
+    }
+
+    info.sections.push_back(std::move(sec));
+  }
+
+  size_t num_sections = info.sections.size();
+  for (size_t i = 0; i < num_sections; ++i) {
+    if (info.sections[i].type != 2 && info.sections[i].type != 11)
+      continue;
+
+    const auto &sym_shdr = *(shdrs.begin() + i);
+
+    auto syms_or_err = elf_file.symbols(&sym_shdr);
+    if (!syms_or_err) {
+      llvm::consumeError(syms_or_err.takeError());
+      continue;
+    }
+
+    auto strtab_or_err = elf_file.getStringTableForSymtab(sym_shdr, shdrs);
+    if (!strtab_or_err) {
+      llvm::consumeError(strtab_or_err.takeError());
+      continue;
+    }
+
+    for (const auto &sym : *syms_or_err) {
+      ElfSymbol esym;
+      esym.info = sym.st_info;
+      esym.shndx = sym.st_shndx;
+      esym.value = sym.st_value;
+      esym.size = sym.st_size;
+
+      auto sym_name_or_err = sym.getName(*strtab_or_err);
+      if (sym_name_or_err)
+        esym.name = sym_name_or_err->str();
+      else
+        llvm::consumeError(sym_name_or_err.takeError());
+
+      info.symbols.push_back(std::move(esym));
+    }
+  }
+
+  return info.text_section_idx >= 0;
+}
+
+std::string FindKernelAtOffset(const ElfInfo &elf_info,
+                               uint64_t text_offset) {
+  for (auto &sym : elf_info.symbols) {
+    uint8_t sym_type = sym.info & 0xf;
+    if (sym_type != 2 && sym_type != 10)
+      continue;
+    if (sym.shndx != static_cast<uint16_t>(elf_info.text_section_idx))
+      continue;
+    uint64_t sym_start = sym.value;
+    uint64_t sym_end = sym.value + sym.size;
+    if (text_offset >= sym_start && text_offset < sym_end)
+      return sym.name;
+  }
+  return "";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LLVM MC infrastructure (transpiler pipeline)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+std::once_flag g_llvm_init_flag;
+std::mutex g_target_cache_mutex;
+const llvm::Target *g_cached_target = nullptr;
+} // namespace
+
+static void InitLLVMTargets() {
+  COMGR::ensureLLVMInitialized();
+}
+
+LLVMState InitLLVMImpl(const std::string &isa_name,
+                       const llvm::Target *cached_target) {
+  std::call_once(g_llvm_init_flag, InitLLVMTargets);
+
+  LLVMState state;
+  state.cpu = ExtractCPU(isa_name);
+  if (state.cpu.empty()) return state;
+
+  llvm::Triple triple("amdgcn-amd-amdhsa");
+
+  if (cached_target) {
+    state.target = cached_target;
+  } else {
+    std::string error;
+    state.target = llvm::TargetRegistry::lookupTarget("amdgcn", triple, error);
+  }
+  if (!state.target) return state;
+
+  state.MRI.reset(
+      state.target->createMCRegInfo(llvm::Triple("amdgcn-amd-amdhsa")));
+  if (!state.MRI) return state;
+
+  llvm::MCTargetOptions mc_opts;
+  state.MAI.reset(state.target->createMCAsmInfo(
+      *state.MRI, llvm::Triple("amdgcn-amd-amdhsa"), mc_opts));
+  if (!state.MAI) return state;
+
+  state.MCII.reset(state.target->createMCInstrInfo());
+  if (!state.MCII) return state;
+
+  state.STI.reset(state.target->createMCSubtargetInfo(
+      llvm::Triple("amdgcn-amd-amdhsa"), state.cpu, ""));
+  if (!state.STI || !state.STI->isCPUStringValid(state.cpu)) return state;
+
+  state.Ctx = std::make_unique<llvm::MCContext>(triple, state.MAI.get(),
+                                                state.MRI.get(),
+                                                state.STI.get());
+  state.MOFI = std::make_unique<llvm::MCObjectFileInfo>();
+  state.MOFI->initMCObjectFileInfo(*state.Ctx, false);
+  state.Ctx->setObjectFileInfo(state.MOFI.get());
+
+  state.disasm.reset(
+      state.target->createMCDisassembler(*state.STI, *state.Ctx));
+  if (!state.disasm) return state;
+
+  unsigned asm_variant = state.MAI->getAssemblerDialect();
+  state.printer.reset(state.target->createMCInstPrinter(
+      triple, asm_variant, *state.MAI, *state.MCII, *state.MRI));
+
+  state.CE = state.target->createMCCodeEmitter(*state.MCII, *state.Ctx);
+
+  state.valid = true;
+  return state;
+}
+
+LLVMState InitLLVMCached(const std::string &isa_name) {
+  std::call_once(g_llvm_init_flag, InitLLVMTargets);
+
+  const llvm::Target *tgt;
+  {
+    std::lock_guard<std::mutex> lock(g_target_cache_mutex);
+    if (!g_cached_target) {
+      std::string error;
+      llvm::Triple triple("amdgcn-amd-amdhsa");
+      g_cached_target =
+          llvm::TargetRegistry::lookupTarget("amdgcn", triple, error);
+    }
+    tgt = g_cached_target;
+  }
+
+  return InitLLVMImpl(isa_name, tgt);
+}
+
+[[nodiscard]] bool DecodeTextSection(const uint8_t *text, uint64_t text_size,
+                                     const LLVMState &llvm_state,
+                                     std::vector<InternalDecodedInst> &decoded) {
+  uint64_t pos = 0;
+  while (pos < text_size) {
+    InternalDecodedInst di;
+    di.offset = pos;
+
+    llvm::ArrayRef<uint8_t> bytes(text + pos, text_size - pos);
+    uint64_t inst_size = 0;
+
+    auto status = llvm_state.disasm->getInstruction(di.inst, inst_size, bytes,
+                                                    pos, llvm::nulls());
+
+    if (status == llvm::MCDisassembler::Fail) {
+      di.size = 4;
+      di.mnemonic = "<unknown>";
+      pos += 4;
+    } else {
+      di.size = static_cast<uint32_t>(inst_size);
+      if (llvm_state.printer) {
+        std::string str;
+        llvm::raw_string_ostream rso(str);
+        llvm_state.printer->printInst(&di.inst, 0, "", *llvm_state.STI, rso);
+        rso.flush();
+        size_t s = str.find_first_not_of(" \t");
+        if (s != std::string::npos) {
+          size_t e = str.find_first_of(" \t", s);
+          di.mnemonic = str.substr(s, e - s);
+        }
+      } else {
+        di.mnemonic = llvm_state.MCII->getName(di.inst.getOpcode()).str();
+      }
+      pos += inst_size;
+    }
+    decoded.push_back(std::move(di));
+  }
+  return true;
+}
+
+int GetVgprNum(unsigned reg, const llvm::MCRegisterInfo &MRI) {
+  const char *name = MRI.getName(reg);
+  if (!name) return -1;
+  std::string rname(name);
+  if (rname.find("VGPR") == 0) {
+    size_t numstart = 4;
+    size_t underscore = rname.find('_', numstart);
+    std::string numstr = rname.substr(
+        numstart, underscore == std::string::npos ? std::string::npos
+                                                  : underscore - numstart);
+    int val = -1;
+    std::from_chars(numstr.data(), numstr.data() + numstr.size(), val);
+    return val;
+  }
+  return -1;
+}
+
+std::pair<int, int> GetVgprRange(unsigned reg,
+                                 const llvm::MCRegisterInfo &MRI) {
+  const char *name = MRI.getName(reg);
+  if (!name) return {-1, 0};
+  std::string rname(name);
+  if (rname.find("VGPR") != 0) return {-1, 0};
+  int count = 1;
+  for (char c : rname)
+    if (c == '_') count++;
+  size_t numstart = 4;
+  size_t numend = rname.find_first_not_of("0123456789", numstart);
+  if (numend == std::string::npos) numend = rname.size();
+  std::string numstr = rname.substr(numstart, numend - numstart);
+  int base = -1;
+  auto [p, ec] = std::from_chars(numstr.data(), numstr.data() + numstr.size(),
+                                 base);
+  if (ec != std::errc())
+    return {-1, 0};
+  return {base, count};
+}
+

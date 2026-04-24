@@ -1,4 +1,3 @@
-// WIP: unwired as of Step 0.4 — not yet in CMakeLists.txt or the comgr build.
 //===- comgr-hotswap-transpiler.cpp - Cross-family ISA transpile pipeline --===//
 //
 // Part of Comgr, under the Apache License v2.0 with LLVM Exceptions. See
@@ -458,7 +457,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
 
   unsigned src_gen = GetEncodingFamily(src_cpu);
   unsigned tgt_gen = GetEncodingFamily(tgt_cpu);
-  OpcodeMapper &mapper = GetOpcodeMapper(src_gen);
+  OpcodeMapper &mapper = GetOpcodeMapper(src_gen, *src_state.MCII);
 
   const uint8_t* text = elf + elf_info.text_offset;
 
@@ -1925,3 +1924,56 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
 
   return AMD_COMGR_STATUS_SUCCESS;
 }
+
+// ── retargetCodeObjectTranspile ──────────────────────────────────────────────
+//
+// Entry point conforming to the COMGR::hotswap internal API. Bridges the
+// TargetIdentifier-based interface used by the comgr public API to the
+// string-based TranspileCodeObject pipeline above.
+
+namespace COMGR {
+namespace hotswap {
+
+amd_comgr_status_t
+retargetCodeObjectTranspile(const void *ElfData, size_t ElfSize,
+                            const TargetIdentifier &SourceIdent,
+                            const TargetIdentifier &TargetIdent,
+                            std::unique_ptr<llvm::MemoryBuffer> &Out) {
+  // Build full ISA strings from the parsed TargetIdentifiers.
+  // Format: "<arch>-<vendor>-<os>--<processor>"
+  std::string SourceIsa =
+      (SourceIdent.Arch + "-" + SourceIdent.Vendor + "-" + SourceIdent.OS +
+       "--" + SourceIdent.Processor)
+          .str();
+  std::string TargetIsa =
+      (TargetIdent.Arch + "-" + TargetIdent.Vendor + "-" + TargetIdent.OS +
+       "--" + TargetIdent.Processor)
+          .str();
+
+  void *OutData = nullptr;
+  size_t OutSize = 0;
+  amd_comgr_hotswap_result_t Result = {};
+
+  amd_comgr_status_t Status = TranspileCodeObject(
+      ElfData, ElfSize, SourceIsa, TargetIsa, &OutData, &OutSize, &Result);
+  if (Status != AMD_COMGR_STATUS_SUCCESS)
+    return Status;
+  if (!OutData || OutSize == 0)
+    return AMD_COMGR_STATUS_ERROR;
+
+  // Wrap the malloc'd buffer in a MemoryBuffer. WritableMemoryBuffer takes
+  // ownership through a copy, then we free the original allocation.
+  Out = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(OutSize);
+  if (!Out) {
+    free(OutData);
+    return AMD_COMGR_STATUS_ERROR_OUT_OF_RESOURCES;
+  }
+  std::memcpy(
+      const_cast<char *>(Out->getBufferStart()), OutData, OutSize);
+  free(OutData);
+
+  return AMD_COMGR_STATUS_SUCCESS;
+}
+
+} // namespace hotswap
+} // namespace COMGR
