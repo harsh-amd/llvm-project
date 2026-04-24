@@ -1,0 +1,531 @@
+//===- comgr-hotswap-transpiler-helpers.cpp - Transpiler utility functions -===//
+//
+// Part of Comgr, under the Apache License v2.0 with LLVM Exceptions. See
+// amd/comgr/LICENSE.TXT in this repository for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "comgr-hotswap-internal.h"
+
+// ── Wave32→Wave64 EXEC Patterns ─────────────────────────────────────────────
+
+bool WritesExecLo(const std::string& line) {
+  size_t mnem_end = line.find_first_of(" \t");
+  if (mnem_end == std::string::npos) return false;
+  size_t op_start = line.find_first_not_of(" \t,", mnem_end);
+  if (op_start == std::string::npos) return false;
+  if (line.compare(op_start, 7, "exec_lo") == 0) return true;
+  std::string mnemonic = line.substr(0, mnem_end);
+  if (mnemonic.find("saveexec_b32") != std::string::npos) return true;
+  return false;
+}
+
+// ── Wait Counter Translation ─────────────────────────────────────────────────
+
+// LEGACY: String-based classification used by text-based handler dispatch.
+// Will be replaced by opcode checks when handlers are migrated to MCInst.
+bool IsWaitInstruction(const std::string& mnemonic) {
+  return mnemonic == "s_wait_loadcnt" || mnemonic == "s_wait_storecnt" ||
+         mnemonic == "s_wait_samplecnt" || mnemonic == "s_wait_bvhcnt" ||
+         mnemonic == "s_wait_expcnt" || mnemonic == "s_wait_dscnt" ||
+         mnemonic == "s_wait_kmcnt" || mnemonic == "s_wait_loadcnt_dscnt" ||
+         mnemonic == "s_wait_storecnt_dscnt" || mnemonic == "s_wait_xcnt" ||
+         mnemonic == "s_wait_asynccnt" || mnemonic == "s_wait_tensorcnt";
+}
+
+std::string TranslateWaitInstruction(const std::string& line) {
+  std::string mnemonic;
+  int count = 0;
+  std::istringstream iss(line);
+  iss >> mnemonic >> count;
+  if (iss.fail()) count = 0;
+
+  if (mnemonic == "s_wait_loadcnt" || mnemonic == "s_wait_samplecnt" ||
+      mnemonic == "s_wait_bvhcnt" || mnemonic == "s_wait_storecnt")
+    return "s_waitcnt vmcnt(" + std::to_string(count) + ")";
+  if (mnemonic == "s_wait_dscnt" || mnemonic == "s_wait_kmcnt")
+    return "s_waitcnt lgkmcnt(" + std::to_string(count) + ")";
+  if (mnemonic == "s_wait_expcnt")
+    return "s_waitcnt expcnt(" + std::to_string(count) + ")";
+  if (mnemonic == "s_wait_loadcnt_dscnt")
+    return "s_waitcnt vmcnt(" + std::to_string(count) +
+           ") lgkmcnt(" + std::to_string(count) + ")";
+  if (mnemonic == "s_wait_storecnt_dscnt")
+    return "s_waitcnt vmcnt(" + std::to_string(count) +
+           ") lgkmcnt(" + std::to_string(count) + ")";
+  return "s_waitcnt vmcnt(0) lgkmcnt(0) expcnt(0)";
+}
+
+// ── Unsupported Instruction Detection ────────────────────────────────────────
+
+// LEGACY: String-based classification used by text-based handler dispatch.
+// Will be replaced by TSFlags/opcode checks when handlers are migrated to MCInst.
+bool IsUnsupportedOnGFX9(const std::string& mnemonic) {
+  if (mnemonic.find("tensor_") == 0) return true;
+  if (mnemonic.find("cluster_") == 0) return true;
+  if (mnemonic.find("_prefetch_") != std::string::npos) return true;
+  if (mnemonic.find("v_permlane16") == 0) return true;
+  if (mnemonic.find("v_permlanex16") == 0) return true;
+  if (mnemonic == "s_wait_alu") return true;
+  if (mnemonic == "s_delay_alu") return true;
+  if (mnemonic == "s_set_vgpr_msb") return true;
+  if (mnemonic == "s_code_end") return true;
+  return false;
+}
+
+// ── VCC Register Width Translation ───────────────────────────────────────────
+
+std::string WidenVccReferences(const std::string& line) {
+  std::string result = line;
+  size_t mnem_end = result.find_first_of(" \t");
+  if (mnem_end == std::string::npos) return result;
+  std::string operands = result.substr(mnem_end);
+  size_t pos = 0;
+  while ((pos = operands.find("vcc_lo", pos)) != std::string::npos) {
+    size_t end = pos + 6;
+    if (end < operands.size() && (std::isalnum(operands[end]) || operands[end] == '_')) {
+      pos = end;
+      continue;
+    }
+    operands.replace(pos, 6, "vcc");
+    pos += 3;
+  }
+  return result.substr(0, mnem_end) + operands;
+}
+
+// ── EXEC Width Widening ──────────────────────────────────────────────────────
+
+std::vector<std::string> WidenExecOperation(const std::string& line, bool compact_mode) {
+  std::vector<std::string> result;
+  std::string mnemonic = line.substr(0, line.find_first_of(" \t"));
+
+  if (mnemonic.find("saveexec_b32") != std::string::npos) {
+    std::string b64_mnem = mnemonic;
+    size_t b32_pos = b64_mnem.find("_b32");
+    b64_mnem.replace(b32_pos, 4, "_b64");
+    size_t not1_pos = b64_mnem.find("_not1_");
+    if (not1_pos != std::string::npos)
+      b64_mnem.replace(not1_pos, 6, "n2_");
+
+    std::string ops_part = line.substr(line.find_first_of(" \t"));
+    size_t op_start = ops_part.find_first_not_of(" \t");
+    if (op_start != std::string::npos) {
+      std::string ops = ops_part.substr(op_start);
+      size_t comma = ops.find(',');
+      if (comma != std::string::npos) {
+        std::string dst = ops.substr(0, comma);
+        size_t ds = dst.find_first_not_of(" \t");
+        size_t de = dst.find_last_not_of(" \t");
+        dst = dst.substr(ds, de - ds + 1);
+        std::string src = ops.substr(comma + 1);
+        size_t ss = src.find_first_not_of(" \t");
+        src = src.substr(ss);
+
+        // Widen vcc_lo → vcc in both source and destination
+        size_t vcc_pos = src.find("vcc_lo");
+        if (vcc_pos != std::string::npos)
+          src.replace(vcc_pos, 6, "vcc");
+        vcc_pos = dst.find("vcc_lo");
+        if (vcc_pos != std::string::npos)
+          dst.replace(vcc_pos, 6, "vcc");
+        // Widen scalar register source for 64-bit saveexec (s<N> → s[N:N+1])
+        {
+          size_t spos = 0;
+          while (spos < src.size() && (src[spos] == ' ' || src[spos] == '\t')) spos++;
+          if (spos < src.size() && src[spos] == 's' && spos + 1 < src.size() &&
+              std::isdigit(src[spos + 1]) && src.find("s[") == std::string::npos &&
+              src.find("vcc") == std::string::npos && src.find("exec") == std::string::npos) {
+            size_t nstart = spos + 1;
+            size_t nend = nstart;
+            while (nend < src.size() && std::isdigit(src[nend])) nend++;
+            int regnum = std::stoi(src.substr(nstart, nend - nstart));
+            // Ensure even alignment for SGPR pairs
+            regnum &= ~1;
+            src = "s[" + std::to_string(regnum) + ":" + std::to_string(regnum + 1) + "]";
+          }
+        }
+
+        if (dst[0] == 's' && dst.size() > 1 && std::isdigit(dst[1])) {
+          std::string src32 = src;
+          if (src32 == "vcc") src32 = "vcc_lo";
+          result.push_back("s_mov_b32 " + dst + ", exec_lo");
+          bool is_or = (b64_mnem.find("s_or_saveexec") == 0);
+          if (is_or)
+            result.push_back("s_or_b32 exec_lo, exec_lo, " + src32);
+          else if (b64_mnem.find("andn2") != std::string::npos)
+            result.push_back("s_andn2_b32 exec_lo, exec_lo, " + src32);
+          else
+            result.push_back("s_and_b32 exec_lo, exec_lo, " + src32);
+          if (is_or || !compact_mode)
+            result.push_back("s_mov_b32 exec_hi, 0");
+          return result;
+        }
+        result.push_back(b64_mnem + " " + dst + ", " + src);
+        result.push_back("s_mov_b32 exec_hi, 0");
+        return result;
+      }
+    }
+    result.push_back(b64_mnem + ops_part);
+    result.push_back("s_mov_b32 exec_hi, 0");
+    return result;
+  }
+
+  result.push_back(line);
+  if (WritesExecLo(line))
+    result.push_back("s_mov_b32 exec_hi, 0");
+  return result;
+}
+
+// ── Operand Syntax Translation ───────────────────────────────────────────────
+
+std::string TranslateOperandSyntax(const std::string& line,
+                                           const std::string& mnemonic) {
+  (void)mnemonic;
+  std::string result = line;
+  {
+    size_t pos = result.find("scope:");
+    if (pos != std::string::npos) {
+      size_t end = result.find_first_of(" \t,", pos);
+      if (end == std::string::npos) end = result.size();
+      result.erase(pos, end - pos);
+    }
+  }
+  {
+    size_t pos = result.find("th:");
+    if (pos != std::string::npos) {
+      size_t end = result.find_first_of(" \t,", pos);
+      if (end == std::string::npos) end = result.size();
+      std::string th_value = result.substr(pos, end - pos);
+      if (th_value.find("TH_ATOMIC_RETURN") != std::string::npos)
+        result.replace(pos, end - pos, "sc0");
+      else
+        result.erase(pos, end - pos);
+    }
+  }
+  {
+    size_t pos = result.find(" nv");
+    while (pos != std::string::npos) {
+      size_t end = pos + 3;
+      if (end >= result.size() || result[end] == ' ' || result[end] == '\t' ||
+          result[end] == ',' || result[end] == '\0') {
+        result.erase(pos, end - pos);
+      } else {
+        pos = result.find(" nv", pos + 1);
+        continue;
+      }
+      pos = result.find(" nv", pos);
+    }
+  }
+  {
+    size_t pos = result.find("scale_offset");
+    if (pos != std::string::npos) {
+      size_t end = pos + 12;
+      if (pos > 0 && (result[pos-1] == ' ' || result[pos-1] == ',')) --pos;
+      result.erase(pos, end - pos);
+    }
+  }
+  // Replace 'null' operand with '0' in buffer instructions (GFX9 doesn't support null soffset)
+  if (mnemonic.find("buffer_") == 0) {
+    size_t pos = result.find(", null");
+    while (pos != std::string::npos) {
+      size_t after = pos + 6;
+      if (after >= result.size() || result[after] == ' ' || result[after] == '\t' ||
+          result[after] == ',' || result[after] == '\0') {
+        result.replace(pos, 6, ", 0");
+        pos = result.find(", null", pos + 3);
+      } else {
+        pos = result.find(", null", pos + 1);
+      }
+    }
+  }
+  // Strip .l/.h subregister suffixes on VGPR operands (GFX12 f16 sub-word, not on GFX9)
+  {
+    size_t pos = 0;
+    while (pos < result.size()) {
+      // Look for v<N>.l or v<N>.h patterns
+      if (result[pos] == 'v' && pos + 1 < result.size() && std::isdigit(result[pos + 1])) {
+        // Skip past the register number
+        size_t numstart = pos + 1;
+        size_t numend = numstart;
+        while (numend < result.size() && std::isdigit(result[numend])) numend++;
+        if (numend + 1 < result.size() && result[numend] == '.' &&
+            (result[numend + 1] == 'l' || result[numend + 1] == 'h')) {
+          // Check that next char after .l/.h is not alphanumeric
+          size_t suffend = numend + 2;
+          if (suffend >= result.size() || !std::isalnum(result[suffend])) {
+            result.erase(numend, 2);
+            continue;
+          }
+        }
+      }
+      pos++;
+    }
+  }
+  // Strip HW_REG_WAVE_SCHED_MODE setreg instructions (not on GFX9)
+  if (mnemonic == "s_setreg_imm32_b32" || mnemonic == "s_setreg_b32") {
+    if (result.find("HW_REG_WAVE_SCHED_MODE") != std::string::npos)
+      return "s_nop 0 ; UNSUPPORTED: " + mnemonic + " HW_REG_WAVE_SCHED_MODE";
+  }
+  while (!result.empty() && (result.back() == ' ' || result.back() == '\t' ||
+                              result.back() == ','))
+    result.pop_back();
+  return result;
+}
+
+// ── Extract/Replace Mnemonic ─────────────────────────────────────────────────
+
+std::string TranspileExtractMnemonic(const std::string& line) {
+  size_t start = line.find_first_not_of(" \t");
+  if (start == std::string::npos) return "";
+  size_t end = line.find_first_of(" \t", start);
+  if (end == std::string::npos) return line.substr(start);
+  return line.substr(start, end - start);
+}
+
+std::string TranspileReplaceMnemonic(const std::string& line,
+                                             const std::string& old_mnemonic,
+                                             const std::string& new_mnemonic) {
+  size_t pos = line.find(old_mnemonic);
+  if (pos == std::string::npos) return line;
+  std::string result = line;
+  result.replace(pos, old_mnemonic.size(), new_mnemonic);
+  return result;
+}
+
+// ── TTMP Taint Analysis ──────────────────────────────────────────────────────
+
+RegKind ClassifyReg(unsigned reg, const llvm::MCRegisterInfo& MRI) {
+  const char* name = MRI.getName(reg);
+  if (!name) return RegKind::Other;
+  if (strncmp(name, "TTMP", 4) == 0) return RegKind::TTMP;
+  if (strncmp(name, "SGPR", 4) == 0) return RegKind::SGPR;
+  if (strncmp(name, "VGPR", 4) == 0) return RegKind::VGPR;
+  if (strcmp(name, "SCC") == 0) return RegKind::SCC;
+  if (strncmp(name, "VCC", 3) == 0) return RegKind::VCC;
+  if (strncmp(name, "EXEC", 4) == 0) return RegKind::EXEC;
+  return RegKind::Other;
+}
+
+bool IsRegTainted(unsigned reg, const std::set<unsigned>& tainted,
+                         const llvm::MCRegisterInfo& MRI) {
+  if (tainted.count(reg)) return true;
+  for (auto sub : MRI.subregs(reg))
+    if (tainted.count(sub)) return true;
+  for (auto sup : MRI.superregs(reg))
+    if (tainted.count(sup)) return true;
+  return false;
+}
+
+void TaintReg(unsigned reg, std::set<unsigned>& tainted,
+                     const llvm::MCRegisterInfo& MRI) {
+  tainted.insert(reg);
+  for (auto sub : MRI.subregs(reg))
+    tainted.insert(sub);
+}
+
+void UntaintReg(unsigned reg, std::set<unsigned>& tainted,
+                       const llvm::MCRegisterInfo& MRI) {
+  tainted.erase(reg);
+  for (auto sub : MRI.subregs(reg))
+    tainted.erase(sub);
+  for (auto sup : MRI.superregs(reg))
+    tainted.erase(sup);
+}
+
+void GetInstRegs(const llvm::MCInst& inst,
+                        const llvm::MCInstrInfo& MCII,
+                        const llvm::MCRegisterInfo& MRI,
+                        std::vector<unsigned>& defs,
+                        std::vector<unsigned>& uses) {
+  (void)MRI;
+  const llvm::MCInstrDesc& desc = MCII.get(inst.getOpcode());
+  unsigned num_defs = desc.getNumDefs();
+  for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+    const auto& op = inst.getOperand(i);
+    if (!op.isReg() || op.getReg() == 0) continue;
+    if (i < num_defs)
+      defs.push_back(op.getReg());
+    else
+      uses.push_back(op.getReg());
+  }
+  for (auto imp : desc.implicit_defs())
+    defs.push_back(imp);
+  for (auto imp : desc.implicit_uses())
+    uses.push_back(imp);
+}
+
+std::vector<TaintResult> AnalyzeTTMPTaint(
+    const std::vector<SourceInstrForTaint>& instrs,
+    const llvm::MCInstrInfo& MCII,
+    const llvm::MCRegisterInfo& MRI) {
+
+  std::vector<TaintResult> results;
+  results.reserve(instrs.size());
+  std::set<unsigned> tainted;
+  bool dump = std::getenv("HSA_HOTSWAP_DUMP") != nullptr;
+
+  for (size_t i = 0; i < instrs.size(); ++i) {
+    const auto& si = instrs[i];
+    const auto& text = si.text;
+    std::string mnemonic = TranspileExtractMnemonic(text);
+
+    TaintResult tr;
+    tr.action = TaintAction::Keep;
+
+    if (!si.valid_inst) {
+      results.push_back(tr);
+      continue;
+    }
+
+    if (mnemonic.empty() || mnemonic[0] != 's' ||
+        mnemonic.find("s_cbranch_") == 0 || mnemonic == "s_branch" ||
+        mnemonic == "s_endpgm" || mnemonic == "s_barrier" ||
+        mnemonic.find("s_barrier_") == 0 || mnemonic == "s_nop" ||
+        mnemonic == "s_waitcnt" || mnemonic.find("s_wait_") == 0 ||
+        mnemonic == "s_clause" || mnemonic == "s_delay_alu" ||
+        mnemonic == "s_wait_alu" || mnemonic == "s_code_end" ||
+        mnemonic == "s_set_inst_prefetch_distance") {
+      results.push_back(tr);
+      continue;
+    }
+
+    std::vector<unsigned> defs, uses;
+    GetInstRegs(si.inst, MCII, MRI, defs, uses);
+
+    bool uses_ttmp = false;
+    for (auto r : uses)
+      if (ClassifyReg(r, MRI) == RegKind::TTMP) { uses_ttmp = true; break; }
+    bool defs_ttmp = false;
+    for (auto r : defs)
+      if (ClassifyReg(r, MRI) == RegKind::TTMP) { defs_ttmp = true; break; }
+
+    if (mnemonic == "s_getreg_b32" &&
+        text.find("HW_REG_IB_STS2") != std::string::npos) {
+      tr.action = TaintAction::Skip;
+      for (auto r : defs) TaintReg(r, tainted, MRI);
+      if (dump) HotswapLog(HotswapLogLevel::Debug) << "hotswap: taint: SKIP (HW_REG_IB_STS2): " << text << "\n";
+      results.push_back(tr);
+      continue;
+    }
+
+    if ((mnemonic == "s_setreg_imm32_b32" || mnemonic == "s_setreg_b32") &&
+        text.find("HW_REG_WAVE_MODE") != std::string::npos) {
+      tr.action = TaintAction::Skip;
+      if (dump) HotswapLog(HotswapLogLevel::Debug) << "hotswap: taint: SKIP (HW_REG_WAVE_MODE): " << text << "\n";
+      results.push_back(tr);
+      continue;
+    }
+
+    if (uses_ttmp || defs_ttmp) {
+      if (mnemonic == "s_cselect_b32") {
+        tr.action = TaintAction::Replace;
+        size_t op_start = text.find(mnemonic) + mnemonic.size();
+        std::string ops = text.substr(op_start);
+        size_t s = ops.find_first_not_of(" \t");
+        size_t e = ops.find_first_of(" \t,", s);
+        if (s != std::string::npos)
+          tr.replace_dst = ops.substr(s, e != std::string::npos ? e - s : std::string::npos);
+        tr.replace_src = (text.find("ttmp9") != std::string::npos) ? "v5" : "v4";
+        for (auto r : defs) UntaintReg(r, tainted, MRI);
+        for (auto r : uses) {
+          if (ClassifyReg(r, MRI) == RegKind::SCC)
+            UntaintReg(r, tainted, MRI);
+        }
+        if (dump) HotswapLog(HotswapLogLevel::Debug) << "hotswap: taint: REPLACE (s_cselect ttmp → "
+                            << tr.replace_dst << " = " << tr.replace_src << "): " << text << "\n";
+      } else {
+        tr.action = TaintAction::Skip;
+        for (auto r : defs) {
+          RegKind kind = ClassifyReg(r, MRI);
+          if (kind == RegKind::SGPR || kind == RegKind::SCC)
+            TaintReg(r, tainted, MRI);
+        }
+        if (dump) HotswapLog(HotswapLogLevel::Debug) << "hotswap: taint: SKIP (direct TTMP): " << text << "\n";
+      }
+      results.push_back(tr);
+      continue;
+    }
+
+    if (mnemonic.find("s_load_") == 0 || mnemonic.find("s_buffer_load_") == 0) {
+      for (auto r : defs) UntaintReg(r, tainted, MRI);
+      if (dump && !tainted.empty())
+        HotswapLog(HotswapLogLevel::Debug) << "hotswap: taint: KEEP (s_load clears taint on defs): " << text << "\n";
+      results.push_back(tr);
+      continue;
+    }
+
+    if (mnemonic.find("s_cmp_") == 0) {
+      bool any_tainted = false;
+      for (auto r : uses)
+        if (IsRegTainted(r, tainted, MRI)) { any_tainted = true; break; }
+      if (any_tainted) {
+        tr.action = TaintAction::Skip;
+        for (auto r : defs) TaintReg(r, tainted, MRI);
+        if (dump) HotswapLog(HotswapLogLevel::Debug) << "hotswap: taint: SKIP (s_cmp tainted): " << text << "\n";
+        results.push_back(tr);
+        continue;
+      }
+      results.push_back(tr);
+      continue;
+    }
+
+    bool has_tainted_src = false;
+    bool has_untainted_sgpr_src = false;
+    for (auto r : uses) {
+      RegKind kind = ClassifyReg(r, MRI);
+      if (kind == RegKind::SGPR || kind == RegKind::SCC) {
+        if (IsRegTainted(r, tainted, MRI))
+          has_tainted_src = true;
+        else
+          has_untainted_sgpr_src = true;
+      }
+    }
+
+    if (has_tainted_src && !has_untainted_sgpr_src) {
+      tr.action = TaintAction::Skip;
+      for (auto r : defs) {
+        RegKind kind = ClassifyReg(r, MRI);
+        if (kind == RegKind::SGPR || kind == RegKind::SCC)
+          TaintReg(r, tainted, MRI);
+      }
+      if (dump) HotswapLog(HotswapLogLevel::Debug) << "hotswap: taint: SKIP (all srcs tainted): " << text << "\n";
+      results.push_back(tr);
+      continue;
+    }
+
+    if (has_tainted_src && has_untainted_sgpr_src) {
+      for (auto r : defs) UntaintReg(r, tainted, MRI);
+      if (dump) HotswapLog(HotswapLogLevel::Debug) << "hotswap: taint: KEEP (mixed taint, clear defs): " << text << "\n";
+      results.push_back(tr);
+      continue;
+    }
+
+    if (!tainted.empty()) {
+      for (auto r : defs) UntaintReg(r, tainted, MRI);
+    }
+    results.push_back(tr);
+  }
+
+  return results;
+}
+
+// ── Operand parsing helper ───────────────────────────────────────────────────
+
+std::vector<std::string> ParseOperandList(const std::string& line,
+                                                  const std::string& mnemonic) {
+  std::string ops = line.substr(line.find(mnemonic) + mnemonic.size());
+  size_t op_start = ops.find_first_not_of(" \t");
+  if (op_start != std::string::npos) ops = ops.substr(op_start);
+  std::vector<std::string> operands;
+  std::istringstream oss(ops);
+  std::string tok;
+  while (std::getline(oss, tok, ',')) {
+    size_t s = tok.find_first_not_of(" \t");
+    size_t e = tok.find_last_not_of(" \t");
+    if (s != std::string::npos)
+      operands.push_back(tok.substr(s, e - s + 1));
+  }
+  return operands;
+}
+
