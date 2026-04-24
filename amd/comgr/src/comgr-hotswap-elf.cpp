@@ -40,6 +40,9 @@ bool applyByteReplace(const RewriteRule &Rule, uint64_t InstOffset,
     return false;
   if (S.SNopBytes.size() != MinInstSize)
     return false;
+  // AMDGPU instructions are always a multiple of 4 bytes (MinInstSize).
+  if (InstSize % MinInstSize != 0)
+    return false;
   std::memcpy(Text + InstOffset, Rule.ReplaceBytes.data(), ReplaceSize);
   uint64_t PadOffset = InstOffset + ReplaceSize;
   uint64_t Remaining = InstSize - ReplaceSize;
@@ -48,6 +51,11 @@ bool applyByteReplace(const RewriteRule &Rule, uint64_t InstOffset,
     PadOffset += MinInstSize;
     Remaining -= MinInstSize;
   }
+  // After NOP-padding, no leftover bytes should remain; if they do the
+  // replacement size is not 4-byte aligned which would leave stale opcode
+  // bits in the tail.
+  if (Remaining != 0)
+    return false;
   return true;
 }
 
