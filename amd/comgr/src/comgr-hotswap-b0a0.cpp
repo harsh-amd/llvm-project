@@ -515,8 +515,11 @@ amd_comgr_status_t retargetCodeObjectB0A0(const void *ElfData, size_t ElfSize,
 
   std::unique_ptr<WritableMemoryBuffer> Result;
   if (!Deferred.empty()) {
-    if (!fixupTrampolineBranches(Deferred, Text, Elf.textSize(), LS))
-      log() << "hotswap: error: some trampolines could not be fixed up\n";
+    if (!fixupTrampolineBranches(Deferred, Text, Elf.textSize(), LS)) {
+      log() << "hotswap: error: some trampolines could not be fixed up; "
+            << "aborting rewrite\n";
+      return AMD_COMGR_STATUS_ERROR;
+    }
 
     Result = Elf.growWithTrampolines(Deferred);
     if (!Result) {
