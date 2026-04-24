@@ -111,9 +111,9 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
   uint32_t e_flags;
   std::memcpy(&e_flags, elf + 48, 4);
   uint8_t target_mach = 0;
-  if (target_cpu == "gfx950") target_mach = 0x4f;
-  else if (target_cpu == "gfx942") target_mach = 0x4c;
-  else if (target_cpu == "gfx90a") target_mach = 0x42;
+  if (target_cpu == "gfx950") target_mach = llvm::ELF::EF_AMDGPU_MACH_AMDGCN_GFX950;
+  else if (target_cpu == "gfx942") target_mach = llvm::ELF::EF_AMDGPU_MACH_AMDGCN_GFX942;
+  else if (target_cpu == "gfx90a") target_mach = llvm::ELF::EF_AMDGPU_MACH_AMDGCN_GFX90A;
   if (target_mach != 0) {
     // Replace arch ID and set sramecc/xnack bits to match target requirements.
     // Bits 8-9: xnack (00=unsupported, 01=any, 10=off, 11=on)
@@ -135,7 +135,7 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
       if (new_isa_full.size() <= old_isa_full.size()) {
         std::memcpy(elf + i, new_isa_full.data(), new_isa_full.size());
         for (size_t j = new_isa_full.size(); j < old_isa_full.size(); ++j)
-          elf[i + j] = ' ';
+          elf[i + j] = '\0';
       }
     }
   }
@@ -145,7 +145,7 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
       if (target_cpu.size() <= 7) {
         std::memcpy(elf + i, target_cpu.c_str(), target_cpu.size());
         for (size_t j = target_cpu.size(); j < 7; ++j)
-          elf[i + j] = '0';
+          elf[i + j] = '\0';
       }
     }
   }
@@ -211,7 +211,6 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
           // For now, just increment the fixmap count if possible
           uint8_t map_byte = elf[desc_start];
           if ((map_byte & 0xF0) == 0x80) {
-            uint8_t count = map_byte & 0x0F;
             // Find and remove "custom.config" key-value
             std::string cc_key = "custom.config";
             for (size_t j = desc_start; j + cc_key.size() + 1 <= desc_start + descsz; ++j) {
