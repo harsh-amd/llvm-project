@@ -133,6 +133,15 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
   for (size_t i = 0; i + old_isa_full.size() <= elf_size; ++i) {
     if (std::memcmp(elf + i, old_isa_full.data(), old_isa_full.size()) == 0) {
       if (new_isa_full.size() <= old_isa_full.size()) {
+        // Also fix the msgpack string length byte preceding the data.
+        // msgpack str8: 0xd9 <len>; fixstr: 0xa0|len (len<32)
+        if (i >= 2 && elf[i - 2] == 0xd9 &&
+            static_cast<uint8_t>(elf[i - 1]) == old_isa_full.size()) {
+          elf[i - 1] = static_cast<uint8_t>(new_isa_full.size());
+        } else if (i >= 1 &&
+                   static_cast<uint8_t>(elf[i - 1]) == (0xa0 | old_isa_full.size())) {
+          elf[i - 1] = 0xa0 | static_cast<uint8_t>(new_isa_full.size());
+        }
         std::memcpy(elf + i, new_isa_full.data(), new_isa_full.size());
         for (size_t j = new_isa_full.size(); j < old_isa_full.size(); ++j)
           elf[i + j] = '\0';
