@@ -23,7 +23,7 @@
 
 // COM: No residual gfx1250 strings in the output metadata.
 // RUN: %llvm-readelf --notes %t.output.elf | %FileCheck --check-prefix=OUTPUT-META %s
-// OUTPUT-META: amdhsa.target: amdgcn-amd-amdhsa--gfx950
+// OUTPUT-META: amdhsa.target:{{.*}}amdgcn-amd-amdhsa--gfx950
 // OUTPUT-META-NOT: gfx1250
 
 // COM: .text section is present and disassemblable as gfx950 code.

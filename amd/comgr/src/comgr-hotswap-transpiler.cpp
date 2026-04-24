@@ -149,8 +149,13 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
     }
   }
 
+  // Replace bare "gfx1250" occurrences in ISA note strings, but NOT inside
+  // msgpack key names like ".gfx1250_revision".
   for (size_t i = 0; i + 7 <= elf_size; ++i) {
     if (std::memcmp(elf + i, "gfx1250", 7) == 0) {
+      // Skip if this is inside a key name (preceded by '.')
+      if (i > 0 && elf[i - 1] == '.')
+        continue;
       if (target_cpu.size() <= 7) {
         std::memcpy(elf + i, target_cpu.c_str(), target_cpu.size());
         for (size_t j = target_cpu.size(); j < 7; ++j)
@@ -188,10 +193,12 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
     }
   }
 
-  // Insert amdhsa.target if not present: replace top-level msgpack fixmap
-  // count from 3 to 4 and repurpose custom.config space for amdhsa.target
+  // Fix amdhsa.target in msgpack metadata to include feature flags.
+  // The runtime requires exact ISA match including :sramecc+:xnack-.
+  // Strategy: find the amdhsa.target value (or custom.config to repurpose)
+  // and write the full target string.
   {
-    // Find the msgpack desc start in the .note section
+    std::string target_isa_full = "amdgcn-amd-amdhsa--" + target_cpu + ":sramecc+:xnack-";
     const char* note_name = "AMDGPU";
     for (size_t i = 0; i + 12 <= elf_size; ++i) {
       if (std::memcmp(elf + i + 12, note_name, 6) == 0) {
@@ -201,55 +208,61 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
         size_t name_aligned = (namesz + 3) & ~3;
         size_t desc_start = i + 12 + name_aligned;
         if (desc_start + descsz > elf_size) break;
-        // Check if amdhsa.target already exists
-        std::string tgt_str = "amdhsa.target";
-        bool has_target = false;
-        for (size_t j = desc_start; j + tgt_str.size() <= desc_start + descsz; ++j) {
-          if (std::memcmp(elf + j, tgt_str.data(), tgt_str.size()) == 0) {
-            has_target = true;
-            break;
-          }
+
+        // Find amdhsa.target key in msgpack and rewrite value with features.
+        // The value was already shortened by the ISA string replacement pass,
+        // but it lacks :sramecc+:xnack-. Since the in-place value is too small,
+        // we need to find space. Use the custom.config entry if available,
+        // or if amdhsa.target already exists, rewrite from its key position
+        // through the end of the msgpack descriptor (filling tail with nil).
+        std::string tgt_key = "amdhsa.target";
+        std::string cc_key = "custom.config";
+        size_t tgt_key_pos = (size_t)-1;
+        size_t cc_key_pos = (size_t)-1;
+
+        for (size_t j = desc_start; j + tgt_key.size() + 1 <= desc_start + descsz; ++j) {
+          if (std::memcmp(elf + j + 1, tgt_key.data(), tgt_key.size()) == 0 &&
+              static_cast<uint8_t>(elf[j]) == (0xa0 | tgt_key.size()))
+            tgt_key_pos = j;
+          if (std::memcmp(elf + j + 1, cc_key.data(), cc_key.size()) == 0 &&
+              static_cast<uint8_t>(elf[j]) == (0xa0 | cc_key.size()))
+            cc_key_pos = j;
         }
-        if (!has_target) {
-          // Build the target ISA string
-          std::string isa = "amdgcn-amd-amdhsa--" + target_cpu;
-          // We need to add a new map entry. Strategy:
-          // 1. Remove custom.config entry to make space
-          // 2. Increment map count
-          // 3. Append amdhsa.target entry in freed space
-          // For now, just increment the fixmap count if possible
-          uint8_t map_byte = elf[desc_start];
-          if ((map_byte & 0xF0) == 0x80) {
-            // Find and remove "custom.config" key-value
-            std::string cc_key = "custom.config";
-            for (size_t j = desc_start; j + cc_key.size() + 1 <= desc_start + descsz; ++j) {
-              if (std::memcmp(elf + j + 1, cc_key.data(), cc_key.size()) == 0 &&
-                  elf[j] == (0xa0 | cc_key.size())) {
-                // Found custom.config key at j. The key is fixstr(13) + 13 bytes.
-                // We need to skip the value too (a small map).
-                // Just overwrite with amdhsa.target key-value
-                size_t pos = j;
-                // Write key: fixstr(13) "amdhsa.target"
-                elf[pos++] = 0xa0 | tgt_str.size();
-                std::memcpy(elf + pos, tgt_str.data(), tgt_str.size());
-                pos += tgt_str.size();
-                // Write value: str8(isa)
-                if (isa.size() < 32) {
-                  elf[pos++] = 0xa0 | isa.size();
-                } else {
-                  elf[pos++] = 0xd9;
-                  elf[pos++] = static_cast<uint8_t>(isa.size());
-                }
-                std::memcpy(elf + pos, isa.data(), isa.size());
-                pos += isa.size();
-                // Zero-fill remaining custom.config space
-                size_t end = desc_start + descsz;
-                while (pos < end) elf[pos++] = 0xc0; // msgpack nil
-                HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: added amdhsa.target=" << isa << "\n";
-                break;
-              }
-            }
+
+        // Pick the best write position: prefer custom.config (more space),
+        // fall back to amdhsa.target if it exists
+        size_t write_pos = (size_t)-1;
+        if (cc_key_pos != (size_t)-1) {
+          write_pos = cc_key_pos;
+          // If amdhsa.target doesn't exist yet, increment fixmap count
+          if (tgt_key_pos == (size_t)-1) {
+            uint8_t map_byte = elf[desc_start];
+            if ((map_byte & 0xF0) == 0x80)
+              elf[desc_start] = map_byte; // count stays same: replacing cc with target
           }
+        } else if (tgt_key_pos != (size_t)-1) {
+          write_pos = tgt_key_pos;
+        }
+
+        if (write_pos != (size_t)-1) {
+          size_t pos = write_pos;
+          size_t end = desc_start + descsz;
+          // Write key: fixstr "amdhsa.target"
+          elf[pos++] = 0xa0 | tgt_key.size();
+          std::memcpy(elf + pos, tgt_key.data(), tgt_key.size());
+          pos += tgt_key.size();
+          // Write value: str8 or fixstr
+          if (target_isa_full.size() < 32) {
+            elf[pos++] = 0xa0 | target_isa_full.size();
+          } else {
+            elf[pos++] = 0xd9;
+            elf[pos++] = static_cast<uint8_t>(target_isa_full.size());
+          }
+          std::memcpy(elf + pos, target_isa_full.data(), target_isa_full.size());
+          pos += target_isa_full.size();
+          // Fill remaining with msgpack nil
+          while (pos < end) elf[pos++] = 0xc0;
+          HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: set amdhsa.target=" << target_isa_full << "\n";
         }
         break;
       }
