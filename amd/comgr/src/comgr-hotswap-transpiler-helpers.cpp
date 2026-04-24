@@ -8,6 +8,22 @@
 
 #include "comgr-hotswap-internal.h"
 
+// ── ISA-family predicates ────────────────────────────────────────────────────
+
+namespace COMGR {
+namespace hotswap {
+
+bool isGfx9Target(llvm::StringRef Cpu) {
+  return Cpu.starts_with("gfx9");
+}
+
+bool isGfx12Target(llvm::StringRef Cpu) {
+  return Cpu.starts_with("gfx12");
+}
+
+} // namespace hotswap
+} // namespace COMGR
+
 // ── Wave32→Wave64 EXEC Patterns ─────────────────────────────────────────────
 
 bool WritesExecLo(const std::string& line) {

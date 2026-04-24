@@ -846,6 +846,7 @@ static TranslationResult HandleWMMAInstruction(
   emitRedistribute(acc.first, mfma_acc, dst_w64);
   bool need_decompose = false;
   std::string actual_mfma = mfma_mnem;
+  // TODO(gfx950): verify whether gfx950 supports native 16x16x32 MFMA
   if (target_cpu.find("gfx942") != std::string::npos || target_cpu.find("gfx940") != std::string::npos || target_cpu.find("gfx941") != std::string::npos) {
     if (mfma_mnem == "v_mfma_f32_16x16x32_f16" || mfma_mnem == "v_mfma_f32_16x16x32bf16") {
       need_decompose = true;

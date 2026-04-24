@@ -674,6 +674,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
     uint32_t save_vgpr_y = num_vgprs12 + 1u;
     // Temp SGPRs for exec save/restore in WMMA→MFMA expansion.
     // On gfx942, max addressable SGPR is s101. Need 2 consecutive SGPRs.
+    // TODO(gfx950): verify max addressable SGPR limit
     uint32_t cmpx_temp_sgpr = num_sgprs12;
     if (cmpx_temp_sgpr > 100u) cmpx_temp_sgpr = 100u;
     const std::string sv_x = "v" + std::to_string(save_vgpr_x);
@@ -1459,6 +1460,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
       translated_asm = tmp;
     }
     // TRANS→VALU hazard mitigation for gfx942:
+    // TODO(gfx950): verify whether this hazard applies to gfx950
     // When a TRANS instruction (v_exp_f32, v_rcp_f32, v_rsq_f32, v_sqrt_f32,
     // v_log_f32) writes a VGPR and the next instruction is a VALU that reads
     // the same VGPR, some lanes may read stale data. Insert v_nop between them.

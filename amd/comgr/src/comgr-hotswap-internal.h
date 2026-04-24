@@ -468,6 +468,16 @@ struct PatchContext {
   std::vector<ScratchPatchInfo> &OutScratchPatches;
 };
 
+// -- ISA-family predicates ----------------------------------------------------
+
+/// Return true if \p Cpu is a GFX9 family processor (gfx900, gfx902, gfx904,
+/// gfx906, gfx908, gfx909, gfx90a, gfx90c, gfx940, gfx941, gfx942, gfx950).
+bool isGfx9Target(llvm::StringRef Cpu);
+
+/// Return true if \p Cpu is a GFX12 family processor (gfx1200, gfx1201,
+/// gfx1250).
+bool isGfx12Target(llvm::StringRef Cpu);
+
 // -- Function declarations (B0-to-A0 policy layer) ----------------------------
 
 /// Run the full GFX1250 B0-to-A0 rewrite pipeline on \p ElfData / \p ElfSize.
