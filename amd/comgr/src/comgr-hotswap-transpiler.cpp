@@ -387,6 +387,12 @@ static bool TranslateViaOpcode(const llvm::MCInst &src_inst, unsigned src_opcode
   if (tgt_opcode == static_cast<unsigned>(-1))
     return false;
 
+  // Validate opcode is within range — cross-family mapping can produce
+  // bogus indices when the pseudo->real mapping doesn't exist for the
+  // target generation.
+  if (tgt_opcode >= tgt_MCII.getNumOpcodes())
+    return false;
+
   const llvm::MCInstrDesc &tgt_desc = tgt_MCII.get(tgt_opcode);
 
   out_inst.setOpcode(tgt_opcode);

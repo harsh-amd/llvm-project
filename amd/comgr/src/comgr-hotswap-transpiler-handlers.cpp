@@ -402,7 +402,9 @@ static TranslationResult Handle64BitVALU(
     const std::string&, const std::string&, int scale_temp_vgpr, int, bool) {
   const std::string vtemp = "v" + std::to_string(scale_temp_vgpr);
   if (mnemonic == "v_add_nc_u64" || mnemonic == "v_add_nc_u64_e32" ||
-      mnemonic == "v_add_u64" || mnemonic == "v_add_u64_e32") {
+      mnemonic == "v_add_nc_u64_e64" ||
+      mnemonic == "v_add_u64" || mnemonic == "v_add_u64_e32" ||
+      mnemonic == "v_add_u64_e64") {
     std::string ops = line.substr(line.find(mnemonic) + mnemonic.size());
     struct RegOrImm { char prefix; int lo; int hi; std::string imm; };
     auto parseOperand = [](const std::string& s, size_t& pos) -> RegOrImm {
@@ -535,6 +537,13 @@ static TranslationResult HandleConstantBusFix(
       std::vector<std::string> result;
       for (auto& op : operands) { if (op == "vcc_lo") op = "vcc"; }
       auto& mask = operands[3];
+      // GFX9 v_cndmask_b32 requires VCC or SGPR pair as mask, not VGPR.
+      // If mask is a VGPR, convert to VCC first.
+      if (!mask.empty() && mask[0] == 'v' && mask.find("vcc") == std::string::npos) {
+        result.push_back("v_cmp_ne_u32_e32 vcc, 0, " + mask);
+        mask = "vcc";
+      }
+      // Expand single SGPR to even-aligned pair for 64-bit mask
       if (!mask.empty() && mask[0] == 's' && mask.find('[') == std::string::npos &&
           mask.find("vcc") == std::string::npos && mask.find("exec") == std::string::npos &&
           mask.size() > 1 && std::isdigit((unsigned char)mask[1])) {
@@ -543,12 +552,30 @@ static TranslationResult HandleConstantBusFix(
         int even = n & ~1;
         mask = "s[" + std::to_string(even) + ":" + std::to_string(even + 1) + "]";
       }
-      std::string& src1 = operands[2];
-      bool src1_sgpr = !src1.empty() && src1[0] == 's';
-      bool mask_sgpr = !mask.empty() && (mask[0] == 's' || mask.substr(0, 3) == "vcc" || mask.substr(0, 4) == "exec");
-      if (src1_sgpr && mask_sgpr) {
-        result.push_back("v_mov_b32_e32 " + vtemp + ", " + src1);
-        src1 = vtemp;
+      // Check for constant bus conflict: if both a source operand and the
+      // mask are different SGPRs/VCC, move the SGPR source to a VGPR.
+      auto isSGPRorVCC = [](const std::string& op) -> bool {
+        if (op == "vcc" || op == "vcc_lo") return true;
+        return !op.empty() && op[0] == 's' && op.size() > 1 &&
+               (std::isdigit((unsigned char)op[1]) || op[1] == '[');
+      };
+      auto sgprBase = [](const std::string& op) -> std::string {
+        if (op == "vcc" || op == "vcc_lo") return "vcc";
+        if (op.find('[') != std::string::npos) return op.substr(0, op.find(']') + 1);
+        size_t e = 1;
+        while (e < op.size() && std::isdigit((unsigned char)op[e])) ++e;
+        return op.substr(0, e);
+      };
+      bool mask_is_sgpr = isSGPRorVCC(mask);
+      if (mask_is_sgpr) {
+        std::string mask_base = sgprBase(mask);
+        // Move any SGPR source that differs from the mask base to a VGPR
+        for (int si = 1; si <= 2 && si < (int)operands.size(); ++si) {
+          if (isSGPRorVCC(operands[si]) && sgprBase(operands[si]) != mask_base) {
+            result.push_back("v_mov_b32_e32 " + vtemp + ", " + operands[si]);
+            operands[si] = vtemp;
+          }
+        }
       }
       std::string fixed = mnemonic + " " + operands[0];
       for (size_t i = 1; i < operands.size(); ++i) fixed += ", " + operands[i];

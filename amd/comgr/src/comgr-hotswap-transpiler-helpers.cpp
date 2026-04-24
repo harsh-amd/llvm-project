@@ -278,6 +278,22 @@ std::string TranslateOperandSyntax(const std::string& line,
       pos++;
     }
   }
+  // GFX12 src_flat_scratch_base → GFX9 flat_scratch
+  {
+    // For 64-bit moves (s_mov_b64), use flat_scratch (the 64-bit pair register)
+    if (mnemonic == "s_mov_b64") {
+      size_t pos = result.find("src_flat_scratch_base_lo");
+      if (pos != std::string::npos)
+        result.replace(pos, 24, "flat_scratch");
+    } else {
+      size_t pos = result.find("src_flat_scratch_base_lo");
+      if (pos != std::string::npos)
+        result.replace(pos, 24, "flat_scratch_lo");
+      pos = result.find("src_flat_scratch_base_hi");
+      if (pos != std::string::npos)
+        result.replace(pos, 24, "flat_scratch_hi");
+    }
+  }
   // Strip HW_REG_WAVE_SCHED_MODE setreg instructions (not on GFX9)
   if (mnemonic == "s_setreg_imm32_b32" || mnemonic == "s_setreg_b32") {
     if (result.find("HW_REG_WAVE_SCHED_MODE") != std::string::npos)
