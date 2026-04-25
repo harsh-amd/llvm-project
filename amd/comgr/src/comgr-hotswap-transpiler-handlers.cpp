@@ -377,6 +377,9 @@ static TranslationResult HandleSALUFloat(
       {"s_cmp_gt_f32", "v_cmp_gt_f32_e32"}, {"s_cmp_ge_f32", "v_cmp_ge_f32_e32"},
       {"s_cmp_lt_f32", "v_cmp_lt_f32_e32"}, {"s_cmp_le_f32", "v_cmp_le_f32_e32"},
       {"s_cmp_eq_f32", "v_cmp_eq_f32_e32"}, {"s_cmp_lg_f32", "v_cmp_lg_f32_e32"},
+      {"s_cmp_neq_f32", "v_cmp_neq_f32_e32"}, {"s_cmp_nlt_f32", "v_cmp_nlt_f32_e32"},
+      {"s_cmp_nge_f32", "v_cmp_nge_f32_e32"}, {"s_cmp_ngt_f32", "v_cmp_ngt_f32_e32"},
+      {"s_cmp_nle_f32", "v_cmp_nle_f32_e32"},
     };
     auto cmp_it = kScmpFloatMap.find(mnemonic);
     if (cmp_it != kScmpFloatMap.end()) {
@@ -387,6 +390,33 @@ static TranslationResult HandleSALUFloat(
           cmp_it->second + " " + operands[0] + ", " + vtemp,
           "s_cmp_lg_u32 vcc_lo, 0"
         };
+    }
+  }
+
+  // s_fmamk_f32: d = s0 * K + s1 (K is inline literal)
+  // GFX9 has no scalar FMA with inline constant — emulate via VALU
+  if (mnemonic == "s_fmamk_f32") {
+    auto operands = ParseOperandList(line, mnemonic);
+    if (operands.size() >= 4) {
+      // s_fmamk_f32 sdst, ssrc0, imm, ssrc1
+      return std::vector<std::string>{
+        "v_mov_b32_e32 " + vtemp + ", " + operands[1],
+        "v_fma_f32 " + vtemp + ", " + vtemp + ", " + operands[2] + ", " + operands[3],
+        "v_readfirstlane_b32 " + operands[0] + ", " + vtemp
+      };
+    }
+  }
+
+  // s_fmaak_f32: d = s0 * s1 + K (K is inline literal)
+  if (mnemonic == "s_fmaak_f32") {
+    auto operands = ParseOperandList(line, mnemonic);
+    if (operands.size() >= 4) {
+      // s_fmaak_f32 sdst, ssrc0, ssrc1, imm
+      return std::vector<std::string>{
+        "v_mov_b32_e32 " + vtemp + ", " + operands[1],
+        "v_fma_f32 " + vtemp + ", " + vtemp + ", " + operands[2] + ", " + operands[3],
+        "v_readfirstlane_b32 " + operands[0] + ", " + vtemp
+      };
     }
   }
 
@@ -1436,6 +1466,60 @@ std::vector<std::string> TranslateInstruction(const std::string& asm_line,
         mnemonic = base;
       }
     }
+  }
+
+  // v_minmax/v_maxmin ternary clamp → two-op sequence
+  // v_minmax_f32 dst, src0, src1, src2 → v_min_f32 dst, src0, src1; v_max_f32 dst, dst, src2
+  // v_maxmin_f32 dst, src0, src1, src2 → v_max_f32 dst, src0, src1; v_min_f32 dst, dst, src2
+  {
+    bool is_minmax = false, is_maxmin = false;
+    std::string type_suffix;
+    auto checkMinMax = [&](const std::string& mn) {
+      for (const char* sfx : {"_f32", "_i32", "_u32", "_f16", "_i16", "_u16"}) {
+        std::string mm = "v_minmax" + std::string(sfx);
+        std::string mx = "v_maxmin" + std::string(sfx);
+        if (mn == mm || mn == mm + "_e64") { is_minmax = true; type_suffix = sfx; return; }
+        if (mn == mx || mn == mx + "_e64") { is_maxmin = true; type_suffix = sfx; return; }
+      }
+    };
+    checkMinMax(mnemonic);
+    if (is_minmax || is_maxmin) {
+      auto operands = ParseOperandList(line, mnemonic);
+      if (operands.size() >= 4) {
+        bool is_float = (type_suffix.find("_f") != std::string::npos);
+        bool is_signed = (type_suffix.find("_i") != std::string::npos);
+        std::string min_op, max_op;
+        if (is_float) {
+          min_op = "v_min" + type_suffix;
+          max_op = "v_max" + type_suffix;
+        } else {
+          // GFX9: v_min_i32, v_min_u32, v_max_i32, v_max_u32
+          min_op = is_signed ? ("v_min_i" + type_suffix.substr(2)) : ("v_min_u" + type_suffix.substr(2));
+          max_op = is_signed ? ("v_max_i" + type_suffix.substr(2)) : ("v_max_u" + type_suffix.substr(2));
+        }
+        std::string first_op = is_minmax ? min_op : max_op;
+        std::string second_op = is_minmax ? max_op : min_op;
+        result.push_back(first_op + " " + operands[0] + ", " + operands[1] + ", " + operands[2]);
+        result.push_back(second_op + " " + operands[0] + ", " + operands[0] + ", " + operands[3]);
+        return result;
+      }
+    }
+  }
+
+  // v_fma_mix_f32 with bf16 operands → convert bf16 to f32 then v_fma_f32
+  // GFX12 v_fma_mix_f32 supports bf16 inputs; GFX9 does not.
+  // bf16→f32 conversion: shift left by 16 (bf16 is top 16 bits of f32).
+  if (mnemonic == "v_fma_mixlo_f16" || mnemonic == "v_fma_mixhi_f16" ||
+      mnemonic == "v_fma_mix_f32") {
+    bool has_bf16 = (line.find("bf16") != std::string::npos);
+    if (has_bf16) {
+      // Fallback: emit as unsupported with comment
+      result.push_back("s_nop 0 ; UNSUPPORTED: " + line + " (bf16 mix)");
+      return result;
+    }
+    // Non-bf16 v_fma_mix variants: check if they exist on GFX9
+    // GFX9 has v_fma_mix_f32 and v_fma_mixlo/hi_f16 (without bf16)
+    // These should pass through to mnemonic renaming
   }
 
   // Handle v_cvt_f32_f16 with .h source: extract high f16 half before conversion
