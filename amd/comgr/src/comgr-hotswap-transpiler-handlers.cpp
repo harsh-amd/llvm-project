@@ -130,8 +130,14 @@ static TranslationResult HandleBitopInstruction(
   auto operands = ParseOperandList(line, mnemonic);
   if (bitop_pos != std::string::npos && operands.size() >= 3) {
     std::vector<std::string> clean;
-    for (auto& op : operands)
-      if (op.find("bitop") == std::string::npos) clean.push_back(op);
+    for (auto& op : operands) {
+      size_t bp_op = op.find(" bitop");
+      if (bp_op == std::string::npos) bp_op = op.find("\tbitop");
+      if (bp_op != std::string::npos)
+        clean.push_back(op.substr(0, bp_op));
+      else if (op.find("bitop") == std::string::npos)
+        clean.push_back(op);
+    }
     if (clean.size() >= 3) {
       int truth_table_val = 0;
       std::string hex_str2 = ops.substr(ops.find("bitop3:") != std::string::npos ? ops.find("bitop3:") + 7 : 0);
@@ -155,8 +161,14 @@ static TranslationResult HandleBitopInstruction(
       return std::vector<std::string>{"v_and_b32 " + clean[0] + ", " + clean[1] + ", " + clean[2]};
     }
   }
-  if (operands.size() >= 3)
-    return std::vector<std::string>{"v_and_b32_e32 " + operands[0] + ", " + operands[1] + ", " + operands[2]};
+  if (operands.size() >= 3) {
+    // Strip any trailing bitop3: modifier that leaked into the last operand
+    std::string op2 = operands[2];
+    size_t bp2 = op2.find(" bitop3:");
+    if (bp2 == std::string::npos) bp2 = op2.find("\tbitop3:");
+    if (bp2 != std::string::npos) op2 = op2.substr(0, bp2);
+    return std::vector<std::string>{"v_and_b32_e32 " + operands[0] + ", " + operands[1] + ", " + op2};
+  }
   return std::vector<std::string>{"s_nop 0 ; UNSUPPORTED: " + line};
 }
 

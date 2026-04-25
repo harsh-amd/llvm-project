@@ -416,6 +416,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
     std::string name;
     uint32_t wg_x = 0; // workgroup size X from kernel name (_WGxx_yy_zz)
     uint32_t wg_y = 0; // workgroup size Y
+    uint64_t rodata_kd_file_offset = 0; // file offset of KD in .rodata (0 = embedded in .text)
   };
   std::vector<KernelInfo> kernels;
   for (uint64_t off = 0; off + 256 <= elf_info.text_size; off += 256) {
@@ -426,10 +427,11 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
   }
 
   if (kernels.empty()) {
-    uint64_t code_offset_in_text = 0;
     uint64_t text_vaddr = 0;
     if (elf_info.text_idx >= 0)
       text_vaddr = elf_info.sections[elf_info.text_idx].addr;
+    // Discover all kernel descriptors in .rodata and map each to its
+    // code entry point in .text.  Use FUNC symbols for code size bounds.
     for (const auto& sec : elf_info.sections) {
       if (sec.name == ".rodata" && sec.size >= 64) {
         for (uint64_t off = 0; off + 64 <= sec.size; off += 64) {
@@ -439,17 +441,30 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
           if (entry > 0 && entry < 1000000) {
             uint64_t kd_vaddr = sec.addr + off;
             uint64_t code_vaddr = kd_vaddr + entry;
+            uint64_t code_off = 0;
             if (code_vaddr >= text_vaddr)
-              code_offset_in_text = code_vaddr - text_vaddr;
-            break;
+              code_off = code_vaddr - text_vaddr;
+            KernelInfo ki_info;
+            ki_info.desc_offset = code_off;
+            ki_info.code_offset = code_off;
+            ki_info.wg_x = 0;
+            ki_info.wg_y = 0;
+            ki_info.rodata_kd_file_offset = sec.offset + off;
+            kernels.push_back(ki_info);
           }
         }
         break;
       }
     }
-    HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: no embedded descriptors in .text, "
-              << "code at .text internal offset " << code_offset_in_text << "\n";
-    kernels.push_back({code_offset_in_text, code_offset_in_text, "", 0, 0});
+    // Sort by code offset so per-kernel end boundaries work correctly
+    std::sort(kernels.begin(), kernels.end(),
+              [](const KernelInfo& a, const KernelInfo& b) {
+                return a.code_offset < b.code_offset;
+              });
+    if (kernels.empty())
+      kernels.push_back({0, 0, "", 0, 0});
+    HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: found "
+              << kernels.size() << " kernel(s) via .rodata descriptors\n";
   } else {
     HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: found " << kernels.size()
               << " embedded kernel descriptor(s)\n";
@@ -508,18 +523,42 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
   // Count target instructions emitted (for offset resolution later)
   uint32_t tgt_instr_count = 0;
 
+  uint64_t text_emit_cursor = 0; // tracks how far into .text we've emitted
+
   for (size_t ki = 0; ki < kernels.size(); ++ki) {
     auto& kern = kernels[ki];
 
-    uint64_t emit_end = kern.code_offset;
-    uint64_t emit_start = (kern.desc_offset != kern.code_offset) ? kern.desc_offset : 0;
-    for (uint64_t i = emit_start; i < emit_end; i += 4) {
-      if (i + 4 > elf_info.text_size) break;
-      uint32_t word;
-      std::memcpy(&word, text + i, 4);
-      std::ostringstream oss;
-      oss << ".long 0x" << std::hex << word;
-      translated_asm += oss.str() + "\n";
+    // Emit raw data between previous kernel's code and this kernel's entry.
+    // For embedded-in-.text KDs, this covers the KD bytes.
+    // For rodata KDs, use alignment to match original kernel offsets.
+    if (kern.rodata_kd_file_offset > 0 && ki > 0) {
+      // Rodata KDs: kernels must be at original offsets within .text because
+      // the KD entry_offset is relative to KD vaddr.  Emit .p2align to match.
+      uint64_t align = kern.code_offset;
+      if (align > 0 && (align & (align - 1)) == 0) {
+        // Power of two — determine alignment log2
+        unsigned log2 = 0;
+        uint64_t tmp = align;
+        while (tmp > 1) { tmp >>= 1; ++log2; }
+        translated_asm += ".p2align " + std::to_string(log2) + "\n";
+      } else {
+        // Not a power of two — pad with NOPs to reach exact offset
+        translated_asm += ".org " + std::to_string(kern.code_offset) + "\n";
+      }
+    } else {
+      // Embedded-in-.text KDs or first kernel: emit raw data
+      uint64_t emit_start = text_emit_cursor;
+      uint64_t emit_end = kern.code_offset;
+      if (kern.desc_offset != kern.code_offset && kern.desc_offset < emit_end)
+        emit_start = std::min(emit_start, kern.desc_offset);
+      for (uint64_t i = emit_start; i < emit_end; i += 4) {
+        if (i + 4 > elf_info.text_size) break;
+        uint32_t word;
+        std::memcpy(&word, text + i, 4);
+        std::ostringstream oss;
+        oss << ".long 0x" << std::hex << word;
+        translated_asm += oss.str() + "\n";
+      }
     }
 
     uint32_t num_vgprs12 = 8;
@@ -530,6 +569,9 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
       if (kern.desc_offset != kern.code_offset &&
           kern.desc_offset + 52 <= elf_info.text_size)
         std::memcpy(&rsrc1_src, text + kern.desc_offset + 48, 4);
+      else if (kern.rodata_kd_file_offset > 0 &&
+               kern.rodata_kd_file_offset + 52 <= elf_size)
+        std::memcpy(&rsrc1_src, elf + kern.rodata_kd_file_offset + 48, 4);
       else {
         for (const auto& sec : elf_info.sections) {
           if (sec.name == ".rodata" && sec.size >= 64) {
@@ -715,7 +757,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
           if (!found && !source_instrs.empty())
             snapped_pc = source_instrs.back().pc_offset;
           if (branch_labels.find(snapped_pc) == branch_labels.end())
-            branch_labels[snapped_pc] = ".L_br" + std::to_string(label_counter++);
+            branch_labels[snapped_pc] = ".L_k" + std::to_string(ki) + "_br" + std::to_string(label_counter++);
         }
       }
     }
@@ -765,7 +807,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
         snapped_pc = source_instrs.back().pc_offset;
       // Create label at target
       if (branch_labels.find(snapped_pc) == branch_labels.end())
-        branch_labels[snapped_pc] = ".L_br" + std::to_string(label_counter++);
+        branch_labels[snapped_pc] = ".L_k" + std::to_string(ki) + "_br" + std::to_string(label_counter++);
       // Parse the dest register from s_add_co_i32 sM, ...
       size_t dest_start = add_text.find_first_not_of(" \t", add_text.find(m1) + m1.size());
       std::string dest_reg;
@@ -1316,6 +1358,9 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
         if (!mapping.entries.empty()) { mapping.entries.back().tgt_count += extra; tgt_instr_count += extra; }
       }
     }
+
+    // Update cursor past this kernel's code region
+    text_emit_cursor = code_end;
   }
 
   HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: translated "
