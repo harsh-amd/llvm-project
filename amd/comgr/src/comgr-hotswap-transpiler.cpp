@@ -92,10 +92,11 @@ static void PatchKernelDescriptorsForWave64(uint8_t* elf, size_t elf_size,
     std::memcpy(elf + info.text_offset + offset + 52, &rsrc2, 4);
 
     // Write kernel_code_properties at COv3 offset 56
+    // Clear all SGPR enables except kernarg_ptr, and clear wave32.
     uint16_t props;
     std::memcpy(&props, text + offset + 56, 2);
     props = static_cast<uint16_t>(
-        (static_cast<uint32_t>(props) & ~(1u << 10)) | (1u << 3));
+        ((static_cast<uint32_t>(props) & ~(0x7Fu | (1u << 10))) | (1u << 3)) & 0xFFFFu);
     std::memcpy(elf + info.text_offset + offset + 56, &props, 2);
 
     // Write RSRC3 at COv3 offset 44
@@ -1825,12 +1826,23 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
                 << "hotswap: transpile: KD RSRC2=0x" << std::hex << rsrc2 << "\n";
 
             // Patch kernel_code_properties at offset 56:
+            // GFX12 enables many SGPR fields (dispatch_ptr, queue_ptr, etc.) that
+            // shift the kernarg ptr to a higher SGPR pair. The transpiled code
+            // expects s[0:1] = kernarg_ptr, so we must clear all other enables.
+            // - Clear ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER (bit 0)
+            // - Clear ENABLE_SGPR_DISPATCH_PTR (bit 1)
+            // - Clear ENABLE_SGPR_QUEUE_PTR (bit 2)
+            // - Set   ENABLE_SGPR_KERNARG_SEGMENT_PTR (bit 3)
+            // - Clear ENABLE_SGPR_DISPATCH_ID (bit 4)
+            // - Clear ENABLE_SGPR_FLAT_SCRATCH_INIT (bit 5)
+            // - Clear ENABLE_SGPR_PRIVATE_SEGMENT_SIZE (bit 6)
             // - Clear ENABLE_WAVEFRONT_SIZE32 (bit 10) for wave64
-            // - Set ENABLE_SGPR_KERNARG_SEGMENT_PTR (bit 3)
             uint16_t props;
             std::memcpy(&props, desc + 56, 2);
+            // Clear bits 0-6 (all SGPR enables) and bit 10 (wave32),
+            // then set only bit 3 (kernarg ptr).
             props = static_cast<uint16_t>(
-                ((static_cast<uint32_t>(props) & ~(1u << 10)) | (1u << 3)) & 0xFFFFu);
+                ((static_cast<uint32_t>(props) & ~(0x7Fu | (1u << 10))) | (1u << 3)) & 0xFFFFu);
             std::memcpy(desc + 56, &props, 2);
 
             // Patch RSRC3 at offset 44: set ACCUM_OFFSET for gfx9

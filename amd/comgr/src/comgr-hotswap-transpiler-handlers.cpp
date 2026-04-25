@@ -822,8 +822,15 @@ static TranslationResult HandleMemoryInstruction(
           if (so_pos > 0 && modified[so_pos-1] == ' ') --so_pos;
           modified.erase(so_pos);
         }
-        line = modified;
-        mnemonic = TranspileExtractMnemonic(line);
+        // Apply mnemonic renaming since we're returning early (before the
+        // post-dispatch rename pass).
+        std::string mod_mnem = TranspileExtractMnemonic(modified);
+        const auto& mmap = GetMnemonicMap();
+        auto mit = mmap.find(mod_mnem);
+        if (mit != mmap.end())
+          modified = TranspileReplaceMnemonic(modified, mod_mnem, mit->second);
+        result.push_back(modified);
+        return result;
       }
     }
   }
