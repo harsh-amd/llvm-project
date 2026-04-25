@@ -798,6 +798,29 @@ static TranslationResult HandleConstantBusFix(
 static TranslationResult HandleMemoryInstruction(
     std::string& line, std::string& mnemonic,
     const std::string&, const std::string&, int scale_temp_vgpr, int, bool) {
+  // ds_store_b16_d16_hi → extract high 16 bits + ds_write_b16
+  if (mnemonic == "ds_store_b16_d16_hi") {
+    auto operands = ParseOperandList(line, mnemonic);
+    if (operands.size() >= 2) {
+      std::string vaddr = operands[0];
+      std::string vdata = operands[1];
+      // Strip trailing offset: from vdata if present (no comma separator)
+      size_t off_in_vdata = vdata.find(" offset:");
+      if (off_in_vdata == std::string::npos) off_in_vdata = vdata.find("\toffset:");
+      if (off_in_vdata != std::string::npos) vdata = vdata.substr(0, off_in_vdata);
+      // Find offset if present in original line
+      std::string offset_str;
+      size_t off_pos = line.find("offset:");
+      if (off_pos != std::string::npos)
+        offset_str = " " + line.substr(off_pos);
+      const std::string tmp = "v" + std::to_string(scale_temp_vgpr);
+      std::vector<std::string> result;
+      result.push_back("v_lshrrev_b32_e32 " + tmp + ", 16, " + vdata);
+      result.push_back("ds_write_b16 " + vaddr + ", " + tmp + offset_str);
+      return result;
+    }
+  }
+
   // scale_offset emulation
   if (line.find("scale_offset") != std::string::npos) {
     int shift = 0;
@@ -901,6 +924,8 @@ static TranslationResult HandleWMMAInstruction(
   int dst_w64 = mapping->dst_vgprs_w64;
   std::string mfma_mnem = mapping->mfma_mnem;
   int wmma_temp_base = (scale_temp_vgpr + 2 >= 248) ? scale_temp_vgpr + 2 : 248;
+  // Cap at v250 so all 6 temps (t_lane..t1) fit within v255
+  if (wmma_temp_base > 250) wmma_temp_base = 250;
   int t_lane = wmma_temp_base, t_src = wmma_temp_base + 1,
       t_addr = wmma_temp_base + 2, t_upper = wmma_temp_base + 3,
       t0 = wmma_temp_base + 4, t1 = wmma_temp_base + 5;

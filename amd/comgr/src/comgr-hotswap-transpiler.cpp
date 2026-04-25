@@ -660,8 +660,13 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
       }
     }
 
+    // Temp VGPRs for workgroup ID save. When kernel uses many VGPRs,
+    // cap to stay within v255.  WMMA expansion needs 6 temps starting
+    // at save_vgpr_y+3, so we need save_vgpr_x+9 <= 255 → max 246.
     uint32_t save_vgpr_x = num_vgprs12;
     uint32_t save_vgpr_y = num_vgprs12 + 1u;
+    if (save_vgpr_x > 246u) save_vgpr_x = 246u;
+    if (save_vgpr_y > 247u) save_vgpr_y = 247u;
     // Temp SGPRs for exec save/restore in WMMA→MFMA expansion.
     // On gfx942, max addressable SGPR is s101. Need 2 consecutive SGPRs.
     // TODO(gfx950): verify max addressable SGPR limit
