@@ -596,12 +596,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
     if (num_vgprs12 < 8u) num_vgprs12 = 8u;
     if (num_sgprs12 < 16u) num_sgprs12 = 16u;
 
-    if (num_vgprs12 > 256u) {
-      HotswapLog(HotswapLogLevel::Error) << "hotswap: transpile: kernel " << ki
-                << " uses " << num_vgprs12 << " VGPRs (wave32), exceeds 256 "
-                << "VGPR limit for wave64 target — cannot transpile\n";
-      return AMD_COMGR_STATUS_ERROR;
-    }
+    // VGPR overflow check moved after msgpack .vgpr_count scan below
 
     // Scan MSGPACK for .sgpr_count
     {
@@ -660,6 +655,30 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
       }
     }
 
+    uint64_t code_end = elf_info.text_size;
+    if (ki + 1 < kernels.size())
+      code_end = kernels[ki + 1].desc_offset;
+
+    // Skip kernels that exceed the wave64 VGPR limit — preserve original
+    // code bytes so the rest of the multi-kernel code object can transpile.
+    if (num_vgprs12 > 256u) {
+      HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: kernel " << ki
+                << " uses " << num_vgprs12 << " VGPRs (wave32), exceeds 256 "
+                << "VGPR limit for wave64 target — skipping (preserving original code)\n";
+      ++stats.unsupported_skipped;
+      // Emit original code bytes as raw .long data
+      for (uint64_t i = kern.code_offset; i < code_end; i += 4) {
+        if (i + 4 > elf_info.text_size) break;
+        uint32_t word;
+        std::memcpy(&word, text + i, 4);
+        std::ostringstream oss;
+        oss << ".long 0x" << std::hex << word;
+        translated_asm += oss.str() + "\n";
+      }
+      text_emit_cursor = code_end;
+      continue;
+    }
+
     // Temp VGPRs for workgroup ID save. When kernel uses many VGPRs,
     // cap to stay within v255.  WMMA expansion needs 6 temps starting
     // at save_vgpr_y+3, so we need save_vgpr_x+9 <= 255 → max 246.
@@ -674,10 +693,6 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
     if (cmpx_temp_sgpr > 100u) cmpx_temp_sgpr = 100u;
     const std::string sv_x = "v" + std::to_string(save_vgpr_x);
     const std::string sv_y = "v" + std::to_string(save_vgpr_y);
-
-    uint64_t code_end = elf_info.text_size;
-    if (ki + 1 < kernels.size())
-      code_end = kernels[ki + 1].desc_offset;
 
     struct SourceInstr {
       std::string text;
