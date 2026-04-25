@@ -1400,26 +1400,49 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
     }
     replaceAll(translated_asm, "v_add_nc_u32 ", "v_add_u32_e32 ");
     replaceAll(translated_asm, "v_sub_nc_u32 ", "v_sub_u32_e32 ");
-    // Constant bus fix: VALU with two distinct SGPR sources
+    // GFX12 v_add_i32 → GFX9 v_add_u32 (no carry variant)
+    replaceAll(translated_asm, "v_add_i32_e32 ", "v_add_u32_e32 ");
+    replaceAll(translated_asm, "v_add_i32_e64 ", "v_add_u32_e64 ");
+    replaceAll(translated_asm, "v_sub_i32_e32 ", "v_sub_u32_e32 ");
+    replaceAll(translated_asm, "v_sub_i32_e64 ", "v_sub_u32_e64 ");
+    // GFX12 'null' operand (discard carry) → GFX9 'vcc'
+    replaceAll(translated_asm, ", null,", ", vcc,");
+    replaceAll(translated_asm, " null,", " vcc,");
+    // GFX12 v_subrev_co_ci_u32 → GFX9 v_subbrev_co_u32
+    replaceAll(translated_asm, "v_subrev_co_ci_u32", "v_subbrev_co_u32");
+    // Constant bus fix: VALU with two distinct SGPR sources or SGPR in wrong position
     {
       std::string tmp;
       std::istringstream cbus_iss(translated_asm);
       std::string cbus_line;
       const std::string vfix_reg = "v251";
+      auto isSgpr = [](const std::string& s) -> bool {
+        std::string t = s;
+        if (!t.empty() && t[0] == '-') t = t.substr(1);
+        return !t.empty() && t[0] == 's' && t.size() > 1 &&
+               (std::isdigit((unsigned char)t[1]) || t[1] == '[');
+      };
+      auto isVgpr = [](const std::string& s) -> bool {
+        std::string t = s;
+        if (!t.empty() && t[0] == '-') t = t.substr(1);
+        return !t.empty() && t[0] == 'v' && t.size() > 1 &&
+               std::isdigit((unsigned char)t[1]);
+      };
       while (std::getline(cbus_iss, cbus_line)) {
         if (!cbus_line.empty() && cbus_line[0] == 'v' &&
             cbus_line.find("v_readfirstlane") != 0 &&
             cbus_line.find("v_writelane") != 0 &&
             cbus_line.find("v_readlane") != 0) {
-          auto ops = ParseOperandList(cbus_line, TranspileExtractMnemonic(cbus_line));
+          std::string mnem = TranspileExtractMnemonic(cbus_line);
+          auto ops = ParseOperandList(cbus_line, mnem);
           if (ops.size() >= 3) {
+            // Fix 1: two distinct SGPRs → move second to VGPR
             std::string first_sgpr;
             size_t fix_idx = 0;
             for (size_t oi = 1; oi < ops.size(); ++oi) {
-              std::string s = ops[oi];
-              if (!s.empty() && s[0] == '-') s = s.substr(1);
-              if (!s.empty() && s[0] == 's' && s.size() > 1 &&
-                  (std::isdigit((unsigned char)s[1]) || s[1] == '[')) {
+              if (isSgpr(ops[oi])) {
+                std::string s = ops[oi];
+                if (!s.empty() && s[0] == '-') s = s.substr(1);
                 if (first_sgpr.empty()) first_sgpr = s;
                 else if (s != first_sgpr) { fix_idx = oi; break; }
               }
@@ -1430,9 +1453,16 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
               if (neg) op = op.substr(1);
               tmp += "v_mov_b32_e32 " + vfix_reg + ", " + op + "\n";
               ops[fix_idx] = (neg ? "-" : "") + vfix_reg;
-              std::string mnem = TranspileExtractMnemonic(cbus_line);
               std::string fixed = mnem + " " + ops[0];
               for (size_t oi = 1; oi < ops.size(); ++oi) fixed += ", " + ops[oi];
+              cbus_line = fixed;
+            }
+            // Fix 2: VOP2 _e32 with SGPR in src1 (last source) → swap with src0
+            // if commutative (add, mul, and, or, xor, max, min)
+            else if (mnem.find("_e32") != std::string::npos && ops.size() == 3 &&
+                     isVgpr(ops[1]) && isSgpr(ops[2])) {
+              // Swap src0 and src1 so SGPR is in src0 (valid for e32)
+              std::string fixed = mnem + " " + ops[0] + ", " + ops[2] + ", " + ops[1];
               cbus_line = fixed;
             }
           }
