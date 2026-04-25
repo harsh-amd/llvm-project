@@ -120,11 +120,9 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
     // Bits 10-11: sramecc (00=unsupported, 01=any, 10=off, 11=on)
     // MI300X (gfx942) requires sramecc:on, xnack:off.
     e_flags = (e_flags & ~0xFFFu) | target_mach;
-    if (target_cpu == "gfx942" || target_cpu == "gfx950") {
-      e_flags |= (0x3 << 10) | (0x2 << 8);  // sramecc:on, xnack:off
-    } else if (target_cpu == "gfx90a") {
-      e_flags |= (0x3 << 10) | (0x2 << 8);  // sramecc:on, xnack:off
-    }
+    // Use "any" mode for both sramecc and xnack to maximize compatibility.
+    // The runtime will match any-mode code objects to any device configuration.
+    e_flags |= (0x1 << 10) | (0x1 << 8);  // sramecc:any, xnack:any
     std::memcpy(elf + 48, &e_flags, 4);
   }
 
@@ -133,15 +131,10 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
   for (size_t i = 0; i + old_isa_full.size() <= elf_size; ++i) {
     if (std::memcmp(elf + i, old_isa_full.data(), old_isa_full.size()) == 0) {
       if (new_isa_full.size() <= old_isa_full.size()) {
-        // Also fix the msgpack string length byte preceding the data.
-        // msgpack str8: 0xd9 <len>; fixstr: 0xa0|len (len<32)
-        if (i >= 2 && elf[i - 2] == 0xd9 &&
-            static_cast<uint8_t>(elf[i - 1]) == old_isa_full.size()) {
-          elf[i - 1] = static_cast<uint8_t>(new_isa_full.size());
-        } else if (i >= 1 &&
-                   static_cast<uint8_t>(elf[i - 1]) == (0xa0 | old_isa_full.size())) {
-          elf[i - 1] = 0xa0 | static_cast<uint8_t>(new_isa_full.size());
-        }
+        // Replace the ISA string in-place. Do NOT adjust the msgpack string
+        // length byte — keeping the original length means the trailing NUL
+        // padding stays inside the string value and won't corrupt the
+        // msgpack structure that follows.
         std::memcpy(elf + i, new_isa_full.data(), new_isa_full.size());
         for (size_t j = new_isa_full.size(); j < old_isa_full.size(); ++j)
           elf[i + j] = '\0';
@@ -193,81 +186,9 @@ static void PatchElfMetadata(uint8_t* elf, size_t elf_size,
     }
   }
 
-  // Fix amdhsa.target in msgpack metadata to include feature flags.
-  // The runtime requires exact ISA match including :sramecc+:xnack-.
-  // Strategy: find the amdhsa.target value (or custom.config to repurpose)
-  // and write the full target string.
-  {
-    std::string target_isa_full = "amdgcn-amd-amdhsa--" + target_cpu + ":sramecc+:xnack-";
-    const char* note_name = "AMDGPU";
-    for (size_t i = 0; i + 12 <= elf_size; ++i) {
-      if (std::memcmp(elf + i + 12, note_name, 6) == 0) {
-        uint32_t namesz, descsz;
-        std::memcpy(&namesz, elf + i, 4);
-        std::memcpy(&descsz, elf + i + 4, 4);
-        size_t name_aligned = (namesz + 3) & ~3;
-        size_t desc_start = i + 12 + name_aligned;
-        if (desc_start + descsz > elf_size) break;
-
-        // Find amdhsa.target key in msgpack and rewrite value with features.
-        // The value was already shortened by the ISA string replacement pass,
-        // but it lacks :sramecc+:xnack-. Since the in-place value is too small,
-        // we need to find space. Use the custom.config entry if available,
-        // or if amdhsa.target already exists, rewrite from its key position
-        // through the end of the msgpack descriptor (filling tail with nil).
-        std::string tgt_key = "amdhsa.target";
-        std::string cc_key = "custom.config";
-        size_t tgt_key_pos = (size_t)-1;
-        size_t cc_key_pos = (size_t)-1;
-
-        for (size_t j = desc_start; j + tgt_key.size() + 1 <= desc_start + descsz; ++j) {
-          if (std::memcmp(elf + j + 1, tgt_key.data(), tgt_key.size()) == 0 &&
-              static_cast<uint8_t>(elf[j]) == (0xa0 | tgt_key.size()))
-            tgt_key_pos = j;
-          if (std::memcmp(elf + j + 1, cc_key.data(), cc_key.size()) == 0 &&
-              static_cast<uint8_t>(elf[j]) == (0xa0 | cc_key.size()))
-            cc_key_pos = j;
-        }
-
-        // Pick the best write position: prefer custom.config (more space),
-        // fall back to amdhsa.target if it exists
-        size_t write_pos = (size_t)-1;
-        if (cc_key_pos != (size_t)-1) {
-          write_pos = cc_key_pos;
-          // If amdhsa.target doesn't exist yet, increment fixmap count
-          if (tgt_key_pos == (size_t)-1) {
-            uint8_t map_byte = elf[desc_start];
-            if ((map_byte & 0xF0) == 0x80)
-              elf[desc_start] = map_byte; // count stays same: replacing cc with target
-          }
-        } else if (tgt_key_pos != (size_t)-1) {
-          write_pos = tgt_key_pos;
-        }
-
-        if (write_pos != (size_t)-1) {
-          size_t pos = write_pos;
-          size_t end = desc_start + descsz;
-          // Write key: fixstr "amdhsa.target"
-          elf[pos++] = 0xa0 | tgt_key.size();
-          std::memcpy(elf + pos, tgt_key.data(), tgt_key.size());
-          pos += tgt_key.size();
-          // Write value: str8 or fixstr
-          if (target_isa_full.size() < 32) {
-            elf[pos++] = 0xa0 | target_isa_full.size();
-          } else {
-            elf[pos++] = 0xd9;
-            elf[pos++] = static_cast<uint8_t>(target_isa_full.size());
-          }
-          std::memcpy(elf + pos, target_isa_full.data(), target_isa_full.size());
-          pos += target_isa_full.size();
-          // Fill remaining with msgpack nil
-          while (pos < end) elf[pos++] = 0xc0;
-          HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: set amdhsa.target=" << target_isa_full << "\n";
-        }
-        break;
-      }
-    }
-  }
+  // The amdhsa.target value in msgpack metadata was already patched by the
+  // ISA string replacement above (gfx1250→gfx950 with length byte fix).
+  // ELF flags use "any" mode for sramecc/xnack so no feature suffixes needed.
 
   // Fix kernel_code_entry_byte_offset in the KD: the source ELF may have the
   // kernel entry point at a non-zero offset within .text (due to prefix data),
