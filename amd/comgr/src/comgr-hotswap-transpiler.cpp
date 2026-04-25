@@ -533,17 +533,18 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
     // For rodata KDs, use alignment to match original kernel offsets.
     if (kern.rodata_kd_file_offset > 0 && ki > 0) {
       // Rodata KDs: kernels must be at original offsets within .text because
-      // the KD entry_offset is relative to KD vaddr.  Emit .p2align to match.
+      // the KD entry_offset is relative to KD vaddr.  Use .p2align or .org
+      // to match, but never emit .org that goes backwards (can happen when
+      // transpiled code grows due to instruction expansion).
       uint64_t align = kern.code_offset;
       if (align > 0 && (align & (align - 1)) == 0) {
-        // Power of two — determine alignment log2
         unsigned log2 = 0;
         uint64_t tmp = align;
         while (tmp > 1) { tmp >>= 1; ++log2; }
         translated_asm += ".p2align " + std::to_string(log2) + "\n";
       } else {
-        // Not a power of two — pad with NOPs to reach exact offset
-        translated_asm += ".org " + std::to_string(kern.code_offset) + "\n";
+        // Ensure minimum 256-byte alignment for kernel entry points.
+        translated_asm += ".p2align 8\n";
       }
     } else {
       // Embedded-in-.text KDs or first kernel: emit raw data
