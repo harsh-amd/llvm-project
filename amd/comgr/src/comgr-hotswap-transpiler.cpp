@@ -1575,6 +1575,108 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
                                           << " v_nop(s) for TRANS->VALU hazard mitigation\n";
       }
     }
+    // Strip GFX12 .l/.h sub-register suffixes from VGPR operands.
+    // GFX12 uses .l/.h for 16-bit sub-register access (v8.l = low 16 bits of v8).
+    // GFX9 doesn't have this notation — the bare register is equivalent.
+    {
+      std::string tmp;
+      std::istringstream sub_iss(translated_asm);
+      std::string sub_line;
+      while (std::getline(sub_iss, sub_line)) {
+        // Replace v<N>.l and v<N>.h with v<N> in instruction operands
+        // Match pattern: v followed by digits, then .l or .h, at word boundary
+        std::string fixed;
+        size_t i = 0;
+        while (i < sub_line.size()) {
+          if (sub_line[i] == 'v' && i + 1 < sub_line.size() &&
+              std::isdigit((unsigned char)sub_line[i + 1])) {
+            size_t start = i;
+            ++i; // skip 'v'
+            while (i < sub_line.size() && std::isdigit((unsigned char)sub_line[i]))
+              ++i;
+            // Check for .l or .h suffix
+            if (i + 1 < sub_line.size() && sub_line[i] == '.' &&
+                (sub_line[i + 1] == 'l' || sub_line[i + 1] == 'h')) {
+              // Verify it's a word boundary after .l/.h
+              size_t after = i + 2;
+              if (after >= sub_line.size() || sub_line[after] == ',' ||
+                  sub_line[after] == ' ' || sub_line[after] == '\t' ||
+                  sub_line[after] == ';' || sub_line[after] == '\n') {
+                // Strip the .l/.h suffix — just emit v<N>
+                fixed += sub_line.substr(start, i - start);
+                i = after; // skip past .l/.h
+                continue;
+              }
+            }
+            fixed += sub_line.substr(start, i - start);
+          } else {
+            fixed += sub_line[i];
+            ++i;
+          }
+        }
+        tmp += fixed + "\n";
+      }
+      translated_asm = tmp;
+    }
+    // Fix VOP3 _e64 instructions with literal constants in src0.
+    // GFX9 _e64 encoding doesn't support literal constants — only inline
+    // constants and SGPRs/VGPRs. Move the literal to a temp VGPR first.
+    {
+      std::string tmp;
+      std::istringstream lit_iss(translated_asm);
+      std::string lit_line;
+      const std::string vlit_reg = "v250";
+      auto isLiteralConst = [](const std::string& s) -> bool {
+        if (s.size() < 3) return false;
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) return true;
+        // Negative hex literal
+        if (s[0] == '-' && s.size() > 3 && s[1] == '0' && (s[2] == 'x' || s[2] == 'X'))
+          return true;
+        return false;
+      };
+      auto isInlineConst = [](const std::string& s) -> bool {
+        // GFX9 inline constants: integers -16..64, named floats
+        if (s == "0" || s == "1" || s == "-1" || s == "0.5" || s == "-0.5" ||
+            s == "1.0" || s == "-1.0" || s == "2.0" || s == "-2.0" ||
+            s == "4.0" || s == "-4.0" || s == "0.15915494" ||
+            s == "0x3e22f983") // 1/(2*pi)
+          return true;
+        // Small integer inline constants: 0..64 and -1..-16
+        if (!s.empty() && std::isdigit((unsigned char)s[0])) {
+          int val = 0;
+          auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), val);
+          if (ec == std::errc{} && p == s.data() + s.size() && val >= 0 && val <= 64)
+            return true;
+        }
+        if (s.size() > 1 && s[0] == '-' && std::isdigit((unsigned char)s[1])) {
+          int val = 0;
+          auto [p, ec] = std::from_chars(s.data() + 1, s.data() + s.size(), val);
+          if (ec == std::errc{} && p == s.data() + s.size() && val >= 1 && val <= 16)
+            return true;
+        }
+        return false;
+      };
+      while (std::getline(lit_iss, lit_line)) {
+        if (lit_line.find("_e64") != std::string::npos && !lit_line.empty() &&
+            (lit_line[0] == 'v' || lit_line[0] == 's')) {
+          std::string mnem = TranspileExtractMnemonic(lit_line);
+          if (mnem.find("_e64") != std::string::npos) {
+            auto ops = ParseOperandList(lit_line, mnem);
+            // src0 is ops[1] (after dst) — check if it's a non-inline literal
+            if (ops.size() >= 3 && isLiteralConst(ops[1]) && !isInlineConst(ops[1])) {
+              tmp += "v_mov_b32_e32 " + vlit_reg + ", " + ops[1] + "\n";
+              ops[1] = vlit_reg;
+              std::string fixed = mnem + " " + ops[0];
+              for (size_t oi = 1; oi < ops.size(); ++oi)
+                fixed += ", " + ops[oi];
+              lit_line = fixed;
+            }
+          }
+        }
+        tmp += lit_line + "\n";
+      }
+      translated_asm = tmp;
+    }
     // Fix s_load from s[8:9]+0xc with saved kernarg ptr
     {
       if (translated_asm.find("s_load_dword s1, s[8:9], 0xc") != std::string::npos ||
