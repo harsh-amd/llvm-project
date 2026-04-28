@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -819,8 +820,11 @@ bool IsWaitInstruction(const std::string &mnemonic);
 std::string TranslateWaitInstruction(const std::string &line);
 bool IsUnsupportedOnGFX9(const std::string &mnemonic);
 std::string WidenVccReferences(const std::string &line);
+struct CondMaskContext; // forward declaration
 std::vector<std::string> WidenExecOperation(const std::string &line,
-                                            bool compact_mode = false);
+                                            bool compact_mode = false,
+                                            int cmpx_temp_sgpr = -1,
+                                            const CondMaskContext *cond_ctx = nullptr);
 std::string TranslateOperandSyntax(const std::string &line,
                                    const std::string &target_cpu);
 std::string TranspileExtractMnemonic(const std::string &line);
@@ -842,11 +846,28 @@ std::vector<TaintResult> AnalyzeTTMPTaint(
     const llvm::MCInstrInfo &MCII, const llvm::MCRegisterInfo &MRI);
 std::vector<std::string> ParseOperandList(const std::string &line,
                                           const std::string &mnemonic);
+// Context for wave32→wave64 condition mask SGPR pair tracking.
+// Built by pre-scan of source instructions, consumed by TranslateInstruction.
+struct CondMaskContext {
+  // SGPRs whose v_cmp_e64 result needs 64-bit pair handling (even numbers).
+  std::set<int> cond_pair_sgprs;
+  // Unified map: SGPR number → scratch SGPR holding its hi-half.
+  // Used for v_cmp pairs, condition accumulators, and exec saves.
+  // Key is always the actual SGPR number (positive).
+  std::map<int, int> cond_hi_scratch;
+  // Odd-register v_cmp_e64 destinations. When GFX12 writes v_cmp_e64 to an
+  // odd SGPR sN, the transpiler expands to s[N&~1 : N]. The hi-half is saved
+  // to cond_hi_scratch[N&~1] (keyed by the even partner), and lo is copied
+  // into sN. Condition combining must look up the even partner's scratch.
+  std::set<int> vcmp_odd_dests;
+};
+
 std::vector<std::string> TranslateInstruction(
     const std::string &asm_line, const std::string &source_cpu,
     const std::string &target_cpu, int scale_temp_vgpr = 7,
     int cmpx_temp_sgpr = 16, bool compact_mode = false,
-    unsigned opcode = ~0u, const llvm::MCInstrInfo *MCII = nullptr);
+    unsigned opcode = ~0u, const llvm::MCInstrInfo *MCII = nullptr,
+    const CondMaskContext *cond_ctx = nullptr);
 
 // ── Transpiler DWARF helpers ─────────────────────────────────────────────────
 

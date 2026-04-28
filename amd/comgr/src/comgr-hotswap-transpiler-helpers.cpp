@@ -112,91 +112,143 @@ std::string WidenVccReferences(const std::string& line) {
 
 // ── EXEC Width Widening ──────────────────────────────────────────────────────
 
-std::vector<std::string> WidenExecOperation(const std::string& line, bool compact_mode) {
+std::vector<std::string> WidenExecOperation(const std::string& line, bool compact_mode, int cmpx_temp_sgpr, const CondMaskContext *cond_ctx) {
   std::vector<std::string> result;
   std::string mnemonic = line.substr(0, line.find_first_of(" \t"));
 
+  // saveexec_b32 is now handled in TranslateInstruction (handlers.cpp)
+  // which has access to scratch SGPRs for proper exec_hi save/restore.
+  // If we reach here, it's a saveexec that wasn't caught — passthrough.
   if (mnemonic.find("saveexec_b32") != std::string::npos) {
-    std::string b64_mnem = mnemonic;
-    size_t b32_pos = b64_mnem.find("_b32");
-    b64_mnem.replace(b32_pos, 4, "_b64");
-    size_t not1_pos = b64_mnem.find("_not1_");
-    if (not1_pos != std::string::npos)
-      b64_mnem.replace(not1_pos, 6, "n2_");
-
-    std::string ops_part = line.substr(line.find_first_of(" \t"));
-    size_t op_start = ops_part.find_first_not_of(" \t");
-    if (op_start != std::string::npos) {
-      std::string ops = ops_part.substr(op_start);
-      size_t comma = ops.find(',');
-      if (comma != std::string::npos) {
-        std::string dst = ops.substr(0, comma);
-        size_t ds = dst.find_first_not_of(" \t");
-        size_t de = dst.find_last_not_of(" \t");
-        dst = dst.substr(ds, de - ds + 1);
-        std::string src = ops.substr(comma + 1);
-        size_t ss = src.find_first_not_of(" \t");
-        src = src.substr(ss);
-
-        // Widen vcc_lo → vcc in both source and destination
-        size_t vcc_pos = src.find("vcc_lo");
-        if (vcc_pos != std::string::npos)
-          src.replace(vcc_pos, 6, "vcc");
-        vcc_pos = dst.find("vcc_lo");
-        if (vcc_pos != std::string::npos)
-          dst.replace(vcc_pos, 6, "vcc");
-        // Widen scalar register source for 64-bit saveexec (s<N> → s[N:N+1])
-        {
-          size_t spos = 0;
-          while (spos < src.size() && (src[spos] == ' ' || src[spos] == '\t')) spos++;
-          if (spos < src.size() && src[spos] == 's' && spos + 1 < src.size() &&
-              std::isdigit(src[spos + 1]) && src.find("s[") == std::string::npos &&
-              src.find("vcc") == std::string::npos && src.find("exec") == std::string::npos) {
-            size_t nstart = spos + 1;
-            size_t nend = nstart;
-            while (nend < src.size() && std::isdigit(src[nend])) nend++;
-            int regnum = std::stoi(src.substr(nstart, nend - nstart));
-            // Ensure even alignment for SGPR pairs
-            regnum &= ~1;
-            src = "s[" + std::to_string(regnum) + ":" + std::to_string(regnum + 1) + "]";
-          }
-        }
-
-        if (dst[0] == 's' && dst.size() > 1 && std::isdigit(dst[1])) {
-          std::string src32 = src;
-          if (src32 == "vcc") src32 = "vcc_lo";
-          // If src was widened to a pair (s[N:N+1]), use only the low half
-          if (src32.find("s[") != std::string::npos) {
-            size_t bracket = src32.find('[');
-            size_t colon = src32.find(':');
-            if (bracket != std::string::npos && colon != std::string::npos)
-              src32 = "s" + src32.substr(bracket + 1, colon - bracket - 1);
-          }
-          result.push_back("s_mov_b32 " + dst + ", exec_lo");
-          bool is_or = (b64_mnem.find("s_or_saveexec") == 0);
-          if (is_or)
-            result.push_back("s_or_b32 exec_lo, exec_lo, " + src32);
-          else if (b64_mnem.find("andn2") != std::string::npos)
-            result.push_back("s_andn2_b32 exec_lo, exec_lo, " + src32);
-          else
-            result.push_back("s_and_b32 exec_lo, exec_lo, " + src32);
-          if (is_or || !compact_mode)
-            result.push_back("s_mov_b32 exec_hi, 0");
-          return result;
-        }
-        result.push_back(b64_mnem + " " + dst + ", " + src);
-        result.push_back("s_mov_b32 exec_hi, 0");
-        return result;
-      }
-    }
-    result.push_back(b64_mnem + ops_part);
-    result.push_back("s_mov_b32 exec_hi, 0");
+    result.push_back(line);
     return result;
   }
 
+  // For s_mov_b32 exec_lo, sN → also restore exec_hi from scratch.
+  // exec_hi was saved to cmpx_temp_sgpr+2 by the saveexec handler.
+  // For s_mov_b32 sN, exec_lo → also save exec_hi to sN|1.
+  // This handles the pattern where wave32 code saves exec before v_cmpx.
+  if (mnemonic == "s_mov_b32" && cmpx_temp_sgpr >= 0) {
+    auto operands = ParseOperandList(line, mnemonic);
+    if (operands.size() == 2) {
+      std::string dst = operands[0], src = operands[1];
+      auto trim = [](std::string& s) {
+        size_t a = s.find_first_not_of(" \t");
+        size_t b = s.find_last_not_of(" \t");
+        if (a != std::string::npos) s = s.substr(a, b - a + 1);
+      };
+      trim(dst); trim(src);
+
+      // Case 1: s_mov_b32 exec_lo, sN → restore exec_hi from per-SGPR scratch
+      if (dst == "exec_lo") {
+        result.push_back(line);
+        // Find the per-SGPR scratch for the source register.
+        std::string exec_hi_src = "s" + std::to_string(cmpx_temp_sgpr + 2); // fallback
+        if (!src.empty() && src[0] == 's' && src.size() > 1 &&
+            std::isdigit((unsigned char)src[1]) && src.find('[') == std::string::npos) {
+          size_t nend = 1;
+          while (nend < src.size() && std::isdigit((unsigned char)src[nend])) nend++;
+          int src_reg = std::stoi(src.substr(1, nend - 1));
+          if (cond_ctx) {
+            auto it = cond_ctx->cond_hi_scratch.find(src_reg);
+            if (it != cond_ctx->cond_hi_scratch.end())
+              exec_hi_src = "s" + std::to_string(it->second);
+            else
+              exec_hi_src = "s" + std::to_string(src_reg | 1);
+          } else {
+            exec_hi_src = "s" + std::to_string(src_reg | 1);
+          }
+        }
+        result.push_back("s_mov_b32 exec_hi, " + exec_hi_src);
+        return result;
+      }
+      // Case 2: s_mov_b32 sN, exec_lo → save exec_hi to per-SGPR scratch.
+      // This handles the pattern where wave32 code saves exec before v_cmpx.
+      if (src == "exec_lo" && !dst.empty() && dst[0] == 's' &&
+          dst.size() > 1 && std::isdigit((unsigned char)dst[1]) &&
+          dst.find('[') == std::string::npos) {
+        result.push_back(line);
+        // Use per-SGPR scratch from unified hi-scratch map if available.
+        size_t nend = 1;
+        while (nend < dst.size() && std::isdigit((unsigned char)dst[nend])) nend++;
+        int dst_reg = std::stoi(dst.substr(1, nend - 1));
+        int exec_hi_dst = dst_reg | 1; // default: natural pair
+        if (cond_ctx) {
+          auto it = cond_ctx->cond_hi_scratch.find(dst_reg);
+          if (it != cond_ctx->cond_hi_scratch.end())
+            exec_hi_dst = it->second;
+        }
+        result.push_back("s_mov_b32 s" + std::to_string(exec_hi_dst) + ", exec_hi");
+        return result;
+      }
+    }
+  }
+
+  // Widen s_*_b32 exec_lo, exec_lo, <src> → also apply to exec_hi
+  // Handles s_and_b32, s_or_b32, s_andn2_b32, s_xor_b32 with exec_lo as dest
+  if ((mnemonic == "s_and_b32" || mnemonic == "s_or_b32" ||
+       mnemonic == "s_andn2_b32" || mnemonic == "s_xor_b32") &&
+      line.find("exec_lo") != std::string::npos) {
+    // Parse: mnemonic exec_lo, src1, src2
+    auto operands = ParseOperandList(line, mnemonic);
+    if (operands.size() == 3 && operands[0].find("exec_lo") != std::string::npos) {
+      result.push_back(line);
+      // Build matching exec_hi instruction
+      auto widenOp = [cmpx_temp_sgpr, cond_ctx](const std::string& op) -> std::string {
+        std::string s = op;
+        size_t ts = s.find_first_not_of(" \t");
+        if (ts != std::string::npos) s = s.substr(ts);
+        if (s == "exec_lo") return "exec_hi";
+        if (s == "vcc_lo" || s == "vcc") return "vcc_hi";
+        // Single SGPR sN → hi half from unified scratch map.
+        if (!s.empty() && s[0] == 's' && s.size() > 1 &&
+            std::isdigit((unsigned char)s[1]) && s.find('[') == std::string::npos) {
+          size_t nend = 1;
+          while (nend < s.size() && std::isdigit((unsigned char)s[nend])) nend++;
+          int regnum = std::stoi(s.substr(1, nend - 1));
+          // Look up unified hi-scratch map for this SGPR.
+          // For odd v_cmp dests, hi is in even partner's scratch.
+          if (cond_ctx) {
+            if ((regnum & 1) && cond_ctx->vcmp_odd_dests.count(regnum)) {
+              auto it = cond_ctx->cond_hi_scratch.find(regnum & ~1);
+              if (it != cond_ctx->cond_hi_scratch.end())
+                return "s" + std::to_string(it->second);
+            }
+            auto it = cond_ctx->cond_hi_scratch.find(regnum);
+            if (it != cond_ctx->cond_hi_scratch.end())
+              return "s" + std::to_string(it->second);
+          }
+          int hi_reg = regnum | 1;
+          if (hi_reg == regnum && cmpx_temp_sgpr >= 0) {
+            // Odd SGPR without scratch: likely a saved exec_lo
+            // from saveexec_b32. Use exec_hi_save register.
+            return "s" + std::to_string(cmpx_temp_sgpr + 2);
+          }
+          return "s" + std::to_string(hi_reg);
+        }
+        // SGPR pair s[N:N+1] → use hi register
+        if (s.find("s[") == 0) {
+          size_t colon = s.find(':');
+          size_t close = s.find(']');
+          if (colon != std::string::npos && close != std::string::npos)
+            return "s" + s.substr(colon + 1, close - colon - 1);
+        }
+        return s;
+      };
+      std::string hi_src1 = widenOp(operands[1]);
+      std::string hi_src2 = widenOp(operands[2]);
+      result.push_back(mnemonic + " exec_hi, " + hi_src1 + ", " + hi_src2);
+      return result;
+    }
+  }
+
+  // Widen s_or_b64 exec, exec, s[N:N+1] and similar — passthrough since
+  // they already operate on 64-bit exec. BUT if the source is s[N:N+1] and
+  // the exec_hi was saved to scratch, the lo half of the pair may be wrong.
+  // For now, trust that the compiler's s[N:N+1] pair is correctly populated
+  // by our saveexec handler.
+
   result.push_back(line);
-  if (WritesExecLo(line))
-    result.push_back("s_mov_b32 exec_hi, 0");
   return result;
 }
 

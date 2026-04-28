@@ -55,7 +55,9 @@ static TranslationResult HandleUnsupportedInstruction(
 static TranslationResult HandleSMEMInstruction(
     const std::string& line, const std::string& mnemonic,
     const std::string&, const std::string&, int, int, bool) {
-  if (mnemonic != "s_load_b96") return std::nullopt;
+  if (mnemonic != "s_load_b96" && mnemonic != "s_load_b128" &&
+      mnemonic != "s_load_b256")
+    return std::nullopt;
   std::vector<std::string> result;
   auto parseSGPRRange = [](const std::string &s, int &lo, int &hi) -> bool {
     size_t start = s.find("s[");
@@ -68,36 +70,95 @@ static TranslationResult HandleSMEMInstruction(
     auto r2 = std::from_chars(s.data() + colon + 1, s.data() + close, hi);
     return r1.ec == std::errc() && r2.ec == std::errc();
   };
+  auto parseOffset = [](const std::string &after_reg, std::string &base_part,
+                         int64_t &offset_val) -> bool {
+    size_t num_start = after_reg.find_last_of(" \t,", after_reg.size()-1);
+    if (num_start == std::string::npos) num_start = 0; else num_start++;
+    std::string offset_str = after_reg.substr(num_start);
+    offset_val = 0;
+    const char* ob = offset_str.data();
+    const char* oe = ob + offset_str.size();
+    int obase = 10;
+    if (offset_str.size() > 2 && offset_str[0] == '0' &&
+        (offset_str[1] == 'x' || offset_str[1] == 'X')) {
+      obase = 16; ob += 2;
+    }
+    auto r = std::from_chars(ob, oe, offset_val, obase);
+    if (r.ec != std::errc()) return false;
+    base_part = after_reg.substr(0, num_start);
+    size_t be = base_part.find_last_not_of(" \t,");
+    if (be != std::string::npos) base_part = base_part.substr(0, be+1);
+    return true;
+  };
+  auto hexStr = [](int64_t v) {
+    std::ostringstream o; o << "0x" << std::hex << v; return o.str();
+  };
   std::string ops_part = line.substr(line.find(mnemonic) + mnemonic.size());
   int lo = 0, hi = 0;
+
+  // s_load_b128: split into two s_load_dwordx2 when offset is not 16-byte aligned.
+  // GFX9 requires s_load_dwordx4 address to be 16-byte aligned.
+  if (mnemonic == "s_load_b128" && parseSGPRRange(ops_part, lo, hi)) {
+    size_t close_bracket = ops_part.find(']', ops_part.find("s["));
+    std::string after_reg = ops_part.substr(close_bracket + 1);
+    std::string base_part;
+    int64_t offset_val = 0;
+    if (parseOffset(after_reg, base_part, offset_val) && (offset_val % 16) != 0) {
+      result.push_back("s_load_dwordx2 s[" + std::to_string(lo) + ":" +
+                        std::to_string(lo+1) + "]" + base_part + ", " + hexStr(offset_val));
+      result.push_back("s_load_dwordx2 s[" + std::to_string(lo+2) + ":" +
+                        std::to_string(lo+3) + "]" + base_part + ", " + hexStr(offset_val + 8));
+      return result;
+    }
+    // Aligned: just rename to s_load_dwordx4
+    std::string new_line = line;
+    size_t mpos = new_line.find("s_load_b128");
+    new_line.replace(mpos, 11, "s_load_dwordx4");
+    return std::vector<std::string>{new_line};
+  }
+
+  // s_load_b256: split into s_load_dwordx4 pairs when offset is not 32-byte aligned.
+  if (mnemonic == "s_load_b256" && parseSGPRRange(ops_part, lo, hi)) {
+    size_t close_bracket = ops_part.find(']', ops_part.find("s["));
+    std::string after_reg = ops_part.substr(close_bracket + 1);
+    std::string base_part;
+    int64_t offset_val = 0;
+    if (parseOffset(after_reg, base_part, offset_val) && (offset_val % 32) != 0) {
+      // Split into s_load_dwordx4 + s_load_dwordx4, checking alignment of each half
+      for (int half = 0; half < 2; half++) {
+        int reg_lo = lo + half * 4;
+        int64_t off = offset_val + half * 16;
+        if ((off % 16) != 0) {
+          result.push_back("s_load_dwordx2 s[" + std::to_string(reg_lo) + ":" +
+                            std::to_string(reg_lo+1) + "]" + base_part + ", " + hexStr(off));
+          result.push_back("s_load_dwordx2 s[" + std::to_string(reg_lo+2) + ":" +
+                            std::to_string(reg_lo+3) + "]" + base_part + ", " + hexStr(off + 8));
+        } else {
+          result.push_back("s_load_dwordx4 s[" + std::to_string(reg_lo) + ":" +
+                            std::to_string(reg_lo+3) + "]" + base_part + ", " + hexStr(off));
+        }
+      }
+      return result;
+    }
+    // Aligned: just rename
+    std::string new_line = line;
+    size_t mpos = new_line.find("s_load_b256");
+    new_line.replace(mpos, 11, "s_load_dwordx8");
+    return std::vector<std::string>{new_line};
+  }
+
+  // s_load_b96: split into s_load_dwordx2 + s_load_dword
   if (parseSGPRRange(ops_part, lo, hi)) {
     size_t close_bracket = ops_part.find(']', ops_part.find("s["));
     std::string after_reg = ops_part.substr(close_bracket + 1);
-    size_t offset_pos = after_reg.rfind("0x");
-    if (offset_pos == std::string::npos) offset_pos = after_reg.rfind(' ');
-    if (offset_pos != std::string::npos) {
-      size_t num_start = after_reg.find_last_of(" \t,", after_reg.size()-1);
-      if (num_start == std::string::npos) num_start = 0; else num_start++;
-      std::string offset_str = after_reg.substr(num_start);
-      int64_t offset_val = 0;
-      {
-        const char* ob = offset_str.data();
-        const char* oe = ob + offset_str.size();
-        int obase = 10;
-        if (offset_str.size() > 2 && offset_str[0] == '0' &&
-            (offset_str[1] == 'x' || offset_str[1] == 'X')) {
-          obase = 16; ob += 2;
-        }
-        std::from_chars(ob, oe, offset_val, obase);
-      }
-      std::string base_part = after_reg.substr(0, num_start);
-      size_t be = base_part.find_last_not_of(" \t,");
-      if (be != std::string::npos) base_part = base_part.substr(0, be+1);
-      auto hexStr = [](int64_t v) { std::ostringstream o; o << std::hex << v; return o.str(); };
+    std::string base_part;
+    int64_t offset_val = 0;
+    if (parseOffset(after_reg, base_part, offset_val)) {
       result.push_back("s_load_dwordx2 s[" + std::to_string(lo) + ":" +
-                        std::to_string(lo+1) + "]" + base_part + ", 0x" + hexStr(offset_val));
+                        std::to_string(lo+1) + "]" + base_part + ", " + hexStr(offset_val));
       result.push_back("s_load_dword s" + std::to_string(lo+2) + base_part +
-                        ", 0x" + hexStr(offset_val + 8));
+                        ", " + hexStr(offset_val + 8));
+      return result;
     }
   }
   if (result.empty()) {
@@ -909,7 +970,7 @@ static TranslationResult HandleWMMAInstruction(
     const std::string&, const std::string& target_cpu,
     int scale_temp_vgpr, int cmpx_temp_sgpr, bool) {
   const std::string stemp = "s" + std::to_string(cmpx_temp_sgpr);
-  const std::string stemp2 = "s" + std::to_string(cmpx_temp_sgpr + 1);
+  const std::string stemp2 = "s" + std::to_string(cmpx_temp_sgpr + 2);
   struct WmmaMfmaMapping { const char* wmma_mnem; const char* mfma_mnem; int dst_vgprs_w32; int src_vgprs_w32; int dst_vgprs_w64; int src_vgprs_w64; };
   static const WmmaMfmaMapping kWmmaMap[] = {
     {"v_wmma_f32_16x16x32_f16", "v_mfma_f32_16x16x32_f16", 8, 8, 4, 4},
@@ -1031,15 +1092,33 @@ static TranslationResult HandleExecOperation(
   (void)scale_temp_vgpr;
   (void)cmpx_temp_sgpr;
   (void)compact_mode;
-  // v_div_scale_f32/f64: GFX12 allows arbitrary SGPR as sdst, GFX9 requires VCC
+  // v_div_scale_f32/f64: GFX12 allows arbitrary SGPR as sdst, GFX9 requires VCC.
+  // When sdst is a non-null SGPR, the compiler expects the flag value in that
+  // SGPR for later use (e.g., s_mov_b32 vcc_lo, sN → v_div_fmas_f32).
+  // Rewrite sdst to vcc and emit a copy-back to preserve the flag.
   if (mnemonic == "v_div_scale_f32" || mnemonic == "v_div_scale_f64") {
     auto operands = ParseOperandList(line, mnemonic);
     // Format: vdst, sdst, src0, src1, src2
     if (operands.size() >= 5 && operands[1] != "vcc") {
+      std::string orig_sdst = operands[1];
+      // Trim whitespace
+      size_t ts = orig_sdst.find_first_not_of(" \t");
+      if (ts != std::string::npos) orig_sdst = orig_sdst.substr(ts);
+      size_t te = orig_sdst.find_last_not_of(" \t");
+      if (te != std::string::npos) orig_sdst = orig_sdst.substr(0, te + 1);
+
       operands[1] = "vcc";
       line = mnemonic + " " + operands[0];
       for (size_t i = 1; i < operands.size(); ++i)
         line += ", " + operands[i];
+
+      // If original sdst was an SGPR (not null), copy VCC back
+      if (orig_sdst != "null" && !orig_sdst.empty() && orig_sdst[0] == 's') {
+        std::vector<std::string> result;
+        result.push_back(line);
+        result.push_back("s_mov_b32 " + orig_sdst + ", vcc_lo");
+        return result;
+      }
     }
   }
   return std::nullopt;
@@ -1051,7 +1130,8 @@ static TranslationResult HandleExecOperation(
 static bool HandleVCmpExpansion(
     std::string& line, const std::string& mnemonic,
     std::vector<std::string>& result,
-    int scale_temp_vgpr, int cmpx_temp_sgpr, bool compact_mode) {
+    int scale_temp_vgpr, int cmpx_temp_sgpr, bool compact_mode,
+    const CondMaskContext *cond_ctx = nullptr) {
   const std::string vtemp = "v" + std::to_string(scale_temp_vgpr);
   // v_cmp_*_e64 with vcc dest + large literal → VOPC _e32
   if (mnemonic.find("v_cmp_") == 0 && mnemonic.find("_e64") != std::string::npos) {
@@ -1090,26 +1170,35 @@ static bool HandleVCmpExpansion(
   }
 
   // v_cmpx _e64
+  // On GFX9 wave64, v_cmpx writes exec (64-bit) AND vcc (64-bit).
+  // We must save/restore BOTH vcc_lo and vcc_hi.
   if (mnemonic.find("v_cmpx_") == 0 && mnemonic.find("_e64") != std::string::npos) {
     std::string base_mnem = mnemonic.substr(0, mnemonic.find("_e64"));
     size_t op_start = line.find(mnemonic) + mnemonic.size();
     std::string ops = line.substr(op_start);
     size_t s = ops.find_first_not_of(" \t");
     if (s != std::string::npos) ops = ops.substr(s);
-    std::string stemp = "s" + std::to_string(cmpx_temp_sgpr);
-    result.push_back("s_mov_b32 " + stemp + ", vcc_lo");
+    std::string stemp_lo = "s" + std::to_string(cmpx_temp_sgpr);
+    std::string stemp_hi = "s" + std::to_string(cmpx_temp_sgpr + 1);
+    result.push_back("s_mov_b32 " + stemp_lo + ", vcc_lo");
+    result.push_back("s_mov_b32 " + stemp_hi + ", vcc_hi");
     result.push_back(base_mnem + " " + ops);
-    result.push_back("s_mov_b32 vcc_lo, " + stemp);
+    result.push_back("s_mov_b32 vcc_lo, " + stemp_lo);
+    result.push_back("s_mov_b32 vcc_hi, " + stemp_hi);
     return true;
   }
 
   // v_cmpx _e32
+  // On GFX9 wave64, v_cmpx writes exec (64-bit) AND vcc (64-bit).
+  // We must save/restore BOTH vcc_lo and vcc_hi.
   if (mnemonic.find("v_cmpx_") == 0 && mnemonic.find("_e64") == std::string::npos) {
-    std::string stemp = "s" + std::to_string(cmpx_temp_sgpr);
-    result.push_back("s_mov_b32 " + stemp + ", vcc_lo");
+    std::string stemp_lo = "s" + std::to_string(cmpx_temp_sgpr);
+    std::string stemp_hi = "s" + std::to_string(cmpx_temp_sgpr + 1);
+    result.push_back("s_mov_b32 " + stemp_lo + ", vcc_lo");
+    result.push_back("s_mov_b32 " + stemp_hi + ", vcc_hi");
     result.push_back(line);
-    result.push_back("s_mov_b32 exec_hi, 0");
-    result.push_back("s_mov_b32 vcc_lo, " + stemp);
+    result.push_back("s_mov_b32 vcc_lo, " + stemp_lo);
+    result.push_back("s_mov_b32 vcc_hi, " + stemp_hi);
     return true;
   }
 
@@ -1134,19 +1223,47 @@ static bool HandleVCmpExpansion(
           std::string rest = trimmed.substr(comma);
           std::string save_reg = "v" + std::to_string(scale_temp_vgpr);
           line = mnemonic + " " + pair + rest;
+          bool is_cond_pair = cond_ctx &&
+              cond_ctx->cond_pair_sgprs.count(even);
+          // Look up per-pair scratch for condition hi.
+          int cond_scratch = -1;
+          if (is_cond_pair && cond_ctx) {
+            auto it = cond_ctx->cond_hi_scratch.find(even);
+            if (it != cond_ctx->cond_hi_scratch.end())
+              cond_scratch = it->second;
+          }
           if (reg_num == even) {
             if (compact_mode) {
               result.push_back(line);
+            } else if (is_cond_pair && cond_scratch >= 0) {
+              // Save odd (will be clobbered by v_cmp hi), emit v_cmp,
+              // save hi to dedicated scratch, restore odd.
+              result.push_back("v_mov_b32_e32 " + save_reg + ", s" + std::to_string(odd));
+              result.push_back(line);
+              result.push_back("s_mov_b32 s" + std::to_string(cond_scratch) + ", s" + std::to_string(odd));
+              result.push_back("v_readfirstlane_b32 s" + std::to_string(odd) + ", " + save_reg);
             } else {
               result.push_back("v_mov_b32_e32 " + save_reg + ", s" + std::to_string(odd));
               result.push_back(line);
               result.push_back("v_readfirstlane_b32 s" + std::to_string(odd) + ", " + save_reg);
             }
           } else {
-            result.push_back("v_mov_b32_e32 " + save_reg + ", s" + std::to_string(even));
-            result.push_back(line);
-            result.push_back("s_mov_b32 s" + std::to_string(reg_num) + ", s" + std::to_string(even));
-            result.push_back("v_readfirstlane_b32 s" + std::to_string(even) + ", " + save_reg);
+            // Odd dest (e.g. v_cmp_e64 s5): expands to v_cmp_e64 s[4:5].
+            // Wave64: s4=lo, s5=hi. Wave32 code uses s5 as "the result".
+            // Copy lo (s4) into s5 (original dest), restore s4.
+            if (is_cond_pair && cond_scratch >= 0) {
+              result.push_back("v_mov_b32_e32 " + save_reg + ", s" + std::to_string(even));
+              result.push_back(line);
+              // Save hi (in odd=reg_num) to scratch before overwriting.
+              result.push_back("s_mov_b32 s" + std::to_string(cond_scratch) + ", s" + std::to_string(reg_num));
+              result.push_back("s_mov_b32 s" + std::to_string(reg_num) + ", s" + std::to_string(even));
+              result.push_back("v_readfirstlane_b32 s" + std::to_string(even) + ", " + save_reg);
+            } else {
+              result.push_back("v_mov_b32_e32 " + save_reg + ", s" + std::to_string(even));
+              result.push_back(line);
+              result.push_back("s_mov_b32 s" + std::to_string(reg_num) + ", s" + std::to_string(even));
+              result.push_back("v_readfirstlane_b32 s" + std::to_string(even) + ", " + save_reg);
+            }
           }
           auto is_ll = [](const std::string& sv) -> bool {
             if (sv.empty()) return false;
@@ -1215,7 +1332,8 @@ std::vector<std::string> TranslateInstruction(const std::string& asm_line,
                                                int cmpx_temp_sgpr,
                                                bool compact_mode,
                                                unsigned opcode,
-                                               const llvm::MCInstrInfo *MCII) {
+                                               const llvm::MCInstrInfo *MCII,
+                                               const CondMaskContext *cond_ctx) {
   std::vector<std::string> result;
   std::string line = asm_line;
 
@@ -1325,6 +1443,56 @@ std::vector<std::string> TranslateInstruction(const std::string& asm_line,
       auto r = Handle64BitVALU(line, mnemonic, source_cpu, target_cpu,
                                scale_temp_vgpr, cmpx_temp_sgpr, compact_mode);
       if (r.has_value()) return *r;
+    }
+
+    // Wave32→Wave64: v_cndmask_b32_e64 with SGPR condition pair setup.
+    // Must run BEFORE HandleConstantBusFix which converts sN → s[even:odd]
+    // but doesn't set up the pair contents (it lacks cond_ctx).
+    if (mnemonic == "v_cndmask_b32_e64" && cond_ctx) {
+      auto ops = ParseOperandList(line, mnemonic);
+      if (ops.size() >= 4) {
+        auto& mask_op = ops[ops.size() - 1];
+        std::string mt = mask_op;
+        size_t mts = mt.find_first_not_of(" \t");
+        if (mts != std::string::npos) mt = mt.substr(mts);
+        if (!mt.empty() && mt[0] == 's' && mt.size() > 1 &&
+            std::isdigit((unsigned char)mt[1]) && mt.find('[') == std::string::npos) {
+          int n = 0;
+          std::from_chars(mt.data() + 1, mt.data() + mt.size(), n);
+          int even = n & ~1;
+          int odd = even + 1;
+          int scratch_key = n;
+          if ((n & 1) && cond_ctx->vcmp_odd_dests.count(n))
+            scratch_key = even;
+          auto it = cond_ctx->cond_hi_scratch.find(scratch_key);
+          if (it != cond_ctx->cond_hi_scratch.end()) {
+            int scratch = it->second;
+            std::vector<std::string> setup;
+            if (n == even) {
+              setup.push_back("s_mov_b32 s" + std::to_string(odd) + ", s" + std::to_string(scratch));
+            } else {
+              setup.push_back("s_mov_b32 s" + std::to_string(even) + ", s" + std::to_string(n));
+              setup.push_back("s_mov_b32 s" + std::to_string(odd) + ", s" + std::to_string(scratch));
+            }
+            // Rewrite the mask operand to pair syntax
+            mask_op = " s[" + std::to_string(even) + ":" + std::to_string(odd) + "]";
+            std::string fixed = mnemonic + " " + ops[0];
+            for (size_t i = 1; i < ops.size(); ++i) fixed += ", " + ops[i];
+            // Now pass through HandleConstantBusFix with the pair syntax
+            // to handle any remaining constant bus conflicts.
+            auto r = HandleConstantBusFix(fixed, mnemonic, source_cpu, target_cpu,
+                                          scale_temp_vgpr, cmpx_temp_sgpr, compact_mode);
+            if (r.has_value()) {
+              // Prepend setup instructions
+              r->insert(r->begin(), setup.begin(), setup.end());
+              return *r;
+            }
+            // Fallthrough: just emit setup + fixed line
+            setup.push_back(fixed);
+            return setup;
+          }
+        }
+      }
     }
 
     // VALU: constant bus fix
@@ -1542,7 +1710,7 @@ std::vector<std::string> TranslateInstruction(const std::string& asm_line,
   line = TranslateOperandSyntax(line, mnemonic);
 
   // v_cmp / v_cmpx wave64 expansion
-  if (HandleVCmpExpansion(line, mnemonic, result, scale_temp_vgpr, cmpx_temp_sgpr, compact_mode))
+  if (HandleVCmpExpansion(line, mnemonic, result, scale_temp_vgpr, cmpx_temp_sgpr, compact_mode, cond_ctx))
     return result;
 
   // VCC width translation
@@ -1606,8 +1774,352 @@ std::vector<std::string> TranslateInstruction(const std::string& asm_line,
     }
   }
 
+  // Wave32→Wave64: handle saveexec_b32 with proper exec_hi save/restore.
+  // Decompose to save both exec_lo and exec_hi, and apply operation to both halves.
+  // Each saveexec destination gets its own per-SGPR scratch for exec_hi,
+  // avoiding clobber when saveexec pairs are nested.
+  if (mnemonic.find("saveexec_b32") != std::string::npos) {
+    auto operands = ParseOperandList(line, mnemonic);
+    if (operands.size() == 2) {
+      std::string dst = operands[0];
+      std::string src = operands[1];
+
+      // Determine the scalar operation
+      std::string op_mnem = "s_and_b32"; // default
+      if (mnemonic.find("s_or_") == 0) op_mnem = "s_or_b32";
+      else if (mnemonic.find("s_andn2_") == 0) op_mnem = "s_andn2_b32";
+      else if (mnemonic.find("s_xor_") == 0) op_mnem = "s_xor_b32";
+
+      // Helper to find per-SGPR scratch for a register's hi half.
+      auto findScratch = [&](const std::string& reg_str) -> std::string {
+        if (reg_str.empty() || reg_str[0] != 's' || reg_str.size() < 2 ||
+            !std::isdigit((unsigned char)reg_str[1]) ||
+            reg_str.find('[') != std::string::npos)
+          return "";
+        size_t nend = 1;
+        while (nend < reg_str.size() && std::isdigit((unsigned char)reg_str[nend])) nend++;
+        int regnum = std::stoi(reg_str.substr(1, nend - 1));
+        if (cond_ctx) {
+          // For odd v_cmp dests, hi is in even partner's scratch.
+          if ((regnum & 1) && cond_ctx->vcmp_odd_dests.count(regnum)) {
+            auto it = cond_ctx->cond_hi_scratch.find(regnum & ~1);
+            if (it != cond_ctx->cond_hi_scratch.end())
+              return "s" + std::to_string(it->second);
+          }
+          auto it = cond_ctx->cond_hi_scratch.find(regnum);
+          if (it != cond_ctx->cond_hi_scratch.end())
+            return "s" + std::to_string(it->second);
+        }
+        return "s" + std::to_string(regnum | 1);
+      };
+
+      // Get the per-SGPR hi scratch for the destination (where exec_hi is saved).
+      std::string dst_hi = findScratch(dst);
+      if (dst_hi.empty())
+        dst_hi = "s" + std::to_string(cmpx_temp_sgpr + 2); // fallback
+
+      // Determine src for lo and hi halves.
+      std::string src_lo = src;
+      std::string src_hi;
+      if (src == "vcc_lo" || src == "vcc") {
+        src_lo = "vcc_lo";
+        src_hi = "vcc_hi";
+      } else {
+        bool is_apply = (mnemonic.find("s_and_") == 0 || mnemonic.find("s_andn2_") == 0);
+        if (is_apply) {
+          // Applying a new mask: src_hi is the condition mask's hi half.
+          src_hi = findScratch(src);
+          if (src_hi.empty())
+            src_hi = "s" + std::to_string(cmpx_temp_sgpr + 2);
+        } else {
+          // OR/XOR (restore): src is the saveexec dst from the matching AND.
+          // Its exec_hi was saved to src's per-SGPR scratch during AND.
+          src_hi = findScratch(src);
+          if (src_hi.empty())
+            src_hi = "s" + std::to_string(cmpx_temp_sgpr + 2);
+        }
+      }
+
+      bool is_restore = (mnemonic.find("s_or_") == 0 || mnemonic.find("s_xor_") == 0);
+      if (is_restore) {
+        // OR/XOR (restore): s_or_saveexec_b32 semantics: dst = exec; exec |= src
+        // Save current exec_hi to dst's scratch, then OR/XOR with src's saved exec_hi.
+        // Care: when dst_hi == src_hi (e.g., s_or_saveexec_b32 s3, s3),
+        // we must read src_hi BEFORE writing dst_hi.
+        std::string scratch = "s" + std::to_string(cmpx_temp_sgpr);
+        if (dst_hi == src_hi) {
+          // Same register: save exec_hi to scratch, apply OR, then put old exec_hi in dst_hi.
+          result.push_back("s_mov_b32 " + scratch + ", exec_hi");
+          result.push_back(op_mnem + " exec_hi, exec_hi, " + src_hi);
+          result.push_back("s_mov_b32 " + dst_hi + ", " + scratch);
+        } else {
+          // Different registers: save exec_hi to dst_hi, apply OR using src_hi.
+          result.push_back("s_mov_b32 " + dst_hi + ", exec_hi");
+          result.push_back(op_mnem + " exec_hi, exec_hi, " + src_hi);
+        }
+        // When dst == src_lo (e.g., s_or_saveexec_b32 s3, s3), saving exec_lo
+        // to dst would clobber the source before the OR/XOR reads it.
+        if (dst == src_lo) {
+          result.push_back("s_mov_b32 " + scratch + ", " + src_lo);
+          result.push_back("s_mov_b32 " + dst + ", exec_lo");
+          result.push_back(op_mnem + " exec_lo, exec_lo, " + scratch);
+        } else {
+          result.push_back("s_mov_b32 " + dst + ", exec_lo");
+          result.push_back(op_mnem + " exec_lo, exec_lo, " + src_lo);
+        }
+      } else {
+        // AND/ANDN2 (applying mask): save exec_hi to dst's scratch, then apply.
+        result.push_back("s_mov_b32 " + dst_hi + ", exec_hi");
+        result.push_back(op_mnem + " exec_hi, exec_hi, " + src_hi);
+        result.push_back("s_mov_b32 " + dst + ", exec_lo");
+        result.push_back(op_mnem + " exec_lo, exec_lo, " + src_lo);
+      }
+      return result;
+    }
+  }
+
+  // Wave32→Wave64: widen scalar condition mask combinations.
+  // When wave32 code does s_and_b32 sN, vcc_lo, sM to combine two condition
+  // masks, the upper 32 bits (vcc_hi, sM+1) are ignored. We must emit a
+  // matching operation for the upper half to correctly handle threads 32-63.
+  if ((mnemonic == "s_and_b32" || mnemonic == "s_or_b32" || mnemonic == "s_andn2_b32") &&
+      line.find("exec") == std::string::npos) {
+    auto operands = ParseOperandList(line, mnemonic);
+    // Pattern: s_and_b32 sN, vcc_lo/vcc, sM  or  s_and_b32 sN, sM, vcc_lo/vcc
+    if (operands.size() == 3) {
+      bool has_vcc = false;
+      int vcc_idx = -1;
+      for (int i = 1; i <= 2; ++i) {
+        std::string op = operands[i];
+        // Trim
+        size_t ts = op.find_first_not_of(" \t");
+        if (ts != std::string::npos) op = op.substr(ts);
+        if (op == "vcc_lo" || op == "vcc") {
+          has_vcc = true;
+          vcc_idx = i;
+        }
+      }
+      auto isSingleSGPR = [](const std::string& op) -> int {
+        std::string s = op;
+        size_t ts = s.find_first_not_of(" \t");
+        if (ts != std::string::npos) s = s.substr(ts);
+        if (s.empty() || s[0] != 's') return -1;
+        if (s.size() < 2 || !std::isdigit((unsigned char)s[1])) return -1;
+        if (s.find('[') != std::string::npos) return -1;
+        size_t nend = 1;
+        while (nend < s.size() && std::isdigit((unsigned char)s[nend])) nend++;
+        if (nend < s.size()) return -1;
+        return std::stoi(s.substr(1, nend - 1));
+      };
+      if (has_vcc) {
+        // Check if dest and non-vcc source are single SGPRs
+        int dst_reg = isSingleSGPR(operands[0]);
+        int other_idx = (vcc_idx == 1) ? 2 : 1;
+        int src_reg = isSingleSGPR(operands[other_idx]);
+        if (dst_reg >= 0 && src_reg >= 0) {
+          // Emit the original instruction for lower 32 bits
+          result.push_back(line);
+          // Emit matching instruction for upper 32 bits.
+          // Use unified hi-scratch map: SGPR number → scratch SGPR.
+          // For odd v_cmp dests, look up even partner's scratch.
+          auto getScratch = [&](int reg) -> std::string {
+            if (cond_ctx) {
+              if ((reg & 1) && cond_ctx->vcmp_odd_dests.count(reg)) {
+                auto it = cond_ctx->cond_hi_scratch.find(reg & ~1);
+                if (it != cond_ctx->cond_hi_scratch.end())
+                  return "s" + std::to_string(it->second);
+              }
+              auto it = cond_ctx->cond_hi_scratch.find(reg);
+              if (it != cond_ctx->cond_hi_scratch.end())
+                return "s" + std::to_string(it->second);
+            }
+            return "s" + std::to_string(reg | 1);
+          };
+          std::string hi_dst = getScratch(dst_reg);
+          std::string hi_src_reg = getScratch(src_reg);
+          std::string hi_vcc = "vcc_hi";
+          if (vcc_idx == 1)
+            result.push_back(mnemonic + " " + hi_dst + ", " + hi_vcc + ", " + hi_src_reg);
+          else
+            result.push_back(mnemonic + " " + hi_dst + ", " + hi_src_reg + ", " + hi_vcc);
+          // Skip the normal WidenExecOperation since we handled it
+          return result;
+        }
+      }
+      // SGPR-SGPR condition combining (no VCC):
+      // s_or_b32 sN, sM, sN  or  s_and_b32 sN, sM, sK
+      // where at least one source is a known condition mask pair SGPR.
+      if (!has_vcc && cond_ctx) {
+        int dst_reg = isSingleSGPR(operands[0]);
+        int src1_reg = isSingleSGPR(operands[1]);
+        int src2_reg = isSingleSGPR(operands[2]);
+        bool src1_is_cond = src1_reg >= 0 &&
+            cond_ctx->cond_pair_sgprs.count(src1_reg & ~1);
+        bool src2_is_cond = src2_reg >= 0 &&
+            cond_ctx->cond_pair_sgprs.count(src2_reg & ~1);
+        if (dst_reg >= 0 && (src1_is_cond || src2_is_cond) &&
+            src1_reg >= 0 && src2_reg >= 0) {
+          result.push_back(line);
+          // Look up hi half for each operand using unified scratch map.
+          // For odd v_cmp dests: the v_cmp handler saves hi to the even
+          // partner's scratch, so look up cond_hi_scratch[reg & ~1].
+          auto getHi = [&](int reg) -> std::string {
+            // For odd v_cmp dests, the hi is in the even partner's scratch
+            if ((reg & 1) && cond_ctx->vcmp_odd_dests.count(reg)) {
+              auto it = cond_ctx->cond_hi_scratch.find(reg & ~1);
+              if (it != cond_ctx->cond_hi_scratch.end())
+                return "s" + std::to_string(it->second);
+            }
+            auto it = cond_ctx->cond_hi_scratch.find(reg);
+            if (it != cond_ctx->cond_hi_scratch.end())
+              return "s" + std::to_string(it->second);
+            return "s" + std::to_string(reg | 1);
+          };
+          std::string hi_dst = getHi(dst_reg);
+          std::string hi_src1 = getHi(src1_reg);
+          std::string hi_src2 = getHi(src2_reg);
+          result.push_back(mnemonic + " " + hi_dst + ", " + hi_src1 + ", " + hi_src2);
+          return result;
+        }
+      }
+    }
+  }
+
+  // Wave32→Wave64: suppress s_mov_b32 sOdd, sEven when sEven is a condition
+  // mask pair. On wave32, v_cmp_e64 writes a 32-bit result to a single SGPR
+  // and the compiler copies it to the odd partner. On wave64, v_cmp_e64 already
+  // writes the full 64-bit pair — this copy would clobber the hi half.
+  if (mnemonic == "s_mov_b32" && cond_ctx && !cond_ctx->cond_pair_sgprs.empty()) {
+    auto operands = ParseOperandList(line, mnemonic);
+    if (operands.size() == 2) {
+      auto parseSGPR = [](const std::string& op) -> int {
+        std::string s = op;
+        size_t ts = s.find_first_not_of(" \t");
+        if (ts != std::string::npos) s = s.substr(ts);
+        if (s.empty() || s[0] != 's') return -1;
+        if (s.size() < 2 || !std::isdigit((unsigned char)s[1])) return -1;
+        if (s.find('[') != std::string::npos) return -1;
+        size_t nend = 1;
+        while (nend < s.size() && std::isdigit((unsigned char)s[nend])) nend++;
+        if (nend < s.size()) return -1;
+        return std::stoi(s.substr(1, nend - 1));
+      };
+      int dst_reg = parseSGPR(operands[0]);
+      int src_reg = parseSGPR(operands[1]);
+      // Pattern: s_mov_b32 sN+1, sN where sN is even and a condition pair.
+      // Wave32 artifact: copies 32-bit v_cmp result to partner.
+      // On wave64, the hi half is in scratch — copy from scratch instead.
+      if (dst_reg >= 0 && src_reg >= 0 && dst_reg == (src_reg | 1) &&
+          (src_reg & 1) == 0 && cond_ctx->cond_pair_sgprs.count(src_reg)) {
+        auto it = cond_ctx->cond_hi_scratch.find(src_reg);
+        if (it != cond_ctx->cond_hi_scratch.end()) {
+          result.push_back("s_mov_b32 s" + std::to_string(dst_reg) +
+                           ", s" + std::to_string(it->second));
+        }
+        // If no scratch (shouldn't happen), suppress entirely.
+        return result;
+      }
+    }
+  }
+
+  // Wave32→Wave64: initialize hi-half scratch when condition accumulator is zeroed.
+  // s_mov_b32 sN, <immediate> where sN has a scratch → also init scratch to same value.
+  if (mnemonic == "s_mov_b32" && cond_ctx && !cond_ctx->cond_hi_scratch.empty()) {
+    auto operands = ParseOperandList(line, mnemonic);
+    if (operands.size() == 2) {
+      auto parseSGPR = [](const std::string& op) -> int {
+        std::string s = op;
+        size_t ts = s.find_first_not_of(" \t");
+        if (ts != std::string::npos) s = s.substr(ts);
+        if (s.empty() || s[0] != 's') return -1;
+        if (s.size() < 2 || !std::isdigit((unsigned char)s[1])) return -1;
+        if (s.find('[') != std::string::npos) return -1;
+        size_t nend = 1;
+        while (nend < s.size() && std::isdigit((unsigned char)s[nend])) nend++;
+        if (nend < s.size()) return -1;
+        return std::stoi(s.substr(1, nend - 1));
+      };
+      int dst_reg = parseSGPR(operands[0]);
+      std::string src = operands[1];
+      size_t ts = src.find_first_not_of(" \t");
+      if (ts != std::string::npos) src = src.substr(ts);
+      // Check if src is an immediate (not a register, not exec_lo).
+      bool is_imm = !src.empty() && src != "exec_lo" &&
+                    (std::isdigit((unsigned char)src[0]) || src[0] == '-' ||
+                     src.find("0x") == 0);
+      if (dst_reg >= 0 && is_imm) {
+        auto it = cond_ctx->cond_hi_scratch.find(dst_reg);
+        if (it != cond_ctx->cond_hi_scratch.end()) {
+          result.push_back(line);
+          result.push_back("s_mov_b32 s" + std::to_string(it->second) + ", " + src);
+          return result;
+        }
+      }
+    }
+  }
+
+  // Wave32→Wave64: else mask computation.
+  // s_xor/and/or_b32 sN, exec_lo, sM (or sN, sM, exec_lo) where dest is NOT exec_lo.
+  // This computes the else-branch mask. Emit matching hi-half instruction.
+  if ((mnemonic == "s_xor_b32" || mnemonic == "s_and_b32" || mnemonic == "s_or_b32" ||
+       mnemonic == "s_andn2_b32") &&
+      line.find("exec_lo") != std::string::npos && cond_ctx) {
+    auto operands = ParseOperandList(line, mnemonic);
+    if (operands.size() == 3) {
+      auto parseSGPR = [](const std::string& op) -> int {
+        std::string s = op;
+        size_t ts = s.find_first_not_of(" \t");
+        if (ts != std::string::npos) s = s.substr(ts);
+        if (s.empty() || s[0] != 's') return -1;
+        if (s.size() < 2 || !std::isdigit((unsigned char)s[1])) return -1;
+        if (s.find('[') != std::string::npos) return -1;
+        size_t nend = 1;
+        while (nend < s.size() && std::isdigit((unsigned char)s[nend])) nend++;
+        if (nend < s.size()) return -1;
+        return std::stoi(s.substr(1, nend - 1));
+      };
+      auto trim = [](const std::string& s) -> std::string {
+        size_t a = s.find_first_not_of(" \t");
+        if (a == std::string::npos) return s;
+        return s.substr(a);
+      };
+      int dst_reg = parseSGPR(operands[0]);
+      std::string src1 = trim(operands[1]);
+      std::string src2 = trim(operands[2]);
+      // Only handle cases where dest is NOT exec_lo (else those go to WidenExecOperation).
+      if (dst_reg >= 0 && trim(operands[0]) != "exec_lo" &&
+          (src1 == "exec_lo" || src2 == "exec_lo")) {
+        auto getScratch = [&](int reg) -> std::string {
+          if ((reg & 1) && cond_ctx->vcmp_odd_dests.count(reg)) {
+            auto it = cond_ctx->cond_hi_scratch.find(reg & ~1);
+            if (it != cond_ctx->cond_hi_scratch.end())
+              return "s" + std::to_string(it->second);
+          }
+          auto it = cond_ctx->cond_hi_scratch.find(reg);
+          if (it != cond_ctx->cond_hi_scratch.end())
+            return "s" + std::to_string(it->second);
+          return "s" + std::to_string(reg | 1);
+        };
+        std::string hi_dst = getScratch(dst_reg);
+        // Map each source operand to its hi-half equivalent.
+        auto mapHi = [&](const std::string& op) -> std::string {
+          if (op == "exec_lo") return "exec_hi";
+          if (op == "vcc_lo" || op == "vcc") return "vcc_hi";
+          int reg = parseSGPR(op);
+          if (reg >= 0) return getScratch(reg);
+          return op;
+        };
+        std::string hi_src1 = mapHi(src1);
+        std::string hi_src2 = mapHi(src2);
+        result.push_back(line);
+        result.push_back(mnemonic + " " + hi_dst + ", " + hi_src1 + ", " + hi_src2);
+        return result;
+      }
+    }
+  }
+
   // EXEC width adaptation (wave32 → wave64)
-  auto exec_result = WidenExecOperation(line, compact_mode);
+  auto exec_result = WidenExecOperation(line, compact_mode, cmpx_temp_sgpr, cond_ctx);
   for (auto& l : exec_result)
     result.push_back(std::move(l));
   return result;

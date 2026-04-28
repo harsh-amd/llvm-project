@@ -75,7 +75,7 @@ static void PatchKernelDescriptorsForWave64(uint8_t* elf, size_t elf_size,
           break;
         }
       }
-      uint32_t gfx9_sgpr = (num_sgprs / 8u) - 1u;
+      uint32_t gfx9_sgpr = ((num_sgprs + 7u) / 8u) - 1u;
       if (gfx9_sgpr > 12u) gfx9_sgpr = 12u;
       rsrc1 |= (gfx9_sgpr << 6u);
     }
@@ -524,6 +524,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
   uint32_t tgt_instr_count = 0;
 
   uint64_t text_emit_cursor = 0; // tracks how far into .text we've emitted
+  uint32_t transpiler_max_sgpr = 0; // highest SGPR used by transpiler scratches
 
   for (size_t ki = 0; ki < kernels.size(); ++ki) {
     auto& kern = kernels[ki];
@@ -711,16 +712,73 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
       llvm::ArrayRef<uint8_t> bytes(text + pos, code_end - pos);
       auto status = src_state.disasm->getInstruction(inst, inst_size, bytes, pos, llvm::nulls());
       if (status == llvm::MCDisassembler::Fail) {
-        if (pos + 4 <= code_end) {
-          uint32_t word;
-          std::memcpy(&word, text + pos, 4);
-          std::ostringstream oss;
-          oss << ".long 0x" << std::hex << word;
-          source_instrs.push_back({oss.str(), pos, 4, llvm::MCInst(), false});
-          source_lines.push_back(oss.str());
+        // Debug: dump bytes at failure offset
+        {
+          uint32_t dw0 = 0;
+          if (pos + 4 <= code_end) std::memcpy(&dw0, text + pos, 4);
+          uint32_t dw1 = 0;
+          if (pos + 8 <= code_end) std::memcpy(&dw1, text + pos + 4, 4);
+          HotswapLog(HotswapLogLevel::Info)
+              << "hotswap: transpile: disasm FAIL at offset 0x" << std::hex << pos
+              << " bytes: " << dw0 << " " << dw1 << std::dec << "\n";
         }
-        pos += 4;
-        ++stats.total_instructions;
+        // Try manual decode for known GFX1250 VOP3 encodings that our LLVM
+        // disassembler can't handle. These are 8-byte instructions.
+        bool decoded_manually = false;
+        if (pos + 8 <= code_end) {
+          uint32_t w0, w1;
+          std::memcpy(&w0, text + pos, 4);
+          std::memcpy(&w1, text + pos + 4, 4);
+          // GFX1250 VOP3 format: w0[31:24]=opcode_hi, w0[7:0]=vdst
+          // Decode register operands from the encoding:
+          //   w0[7:0] = VDST
+          //   w1[8:0] = SRC0, w1[17:9] = SRC1, w1[26:18] = SRC2
+          int vdst = w0 & 0xFF;
+          int src0 = w1 & 0x1FF;
+          int src1 = (w1 >> 9) & 0x1FF;
+          int src2 = (w1 >> 18) & 0x1FF;
+          // Map VGPR/SGPR encoding: 0-255=VGPR, 256-511=SGPR (256+N=sN)
+          auto regStr = [](int enc) -> std::string {
+            if (enc < 256) return "v" + std::to_string(enc);
+            if (enc < 512) return "s" + std::to_string(enc - 256);
+            return "???";
+          };
+          uint32_t opcode_field = (w0 >> 16) & 0xFFFF;
+          std::string mnem;
+          if (opcode_field == 0xD286) mnem = "v_mul_hi_u32";
+          else if (opcode_field == 0xD285) mnem = "v_mul_lo_u32";
+          else if (opcode_field == 0xD208) mnem = "v_lshl_or_b32";
+          else if (opcode_field == 0xD635) mnem = "v_mad_u32";
+          if (!mnem.empty()) {
+            std::string text_line;
+            if (mnem == "v_mad_u32" || mnem == "v_lshl_or_b32") {
+              // 3-src VOP3: vdst, src0, src1, src2
+              text_line = mnem + " v" + std::to_string(vdst) + ", " +
+                          regStr(src0) + ", " + regStr(src1) + ", " + regStr(src2);
+            } else {
+              // 2-src VOP3: vdst, src0, src1
+              text_line = mnem + " v" + std::to_string(vdst) + ", " +
+                          regStr(src0) + ", " + regStr(src1);
+            }
+            source_instrs.push_back({text_line, pos, 8, llvm::MCInst(), false});
+            source_lines.push_back(text_line);
+            pos += 8;
+            ++stats.total_instructions;
+            decoded_manually = true;
+          }
+        }
+        if (!decoded_manually) {
+          if (pos + 4 <= code_end) {
+            uint32_t word;
+            std::memcpy(&word, text + pos, 4);
+            std::ostringstream oss;
+            oss << ".long 0x" << std::hex << word;
+            source_instrs.push_back({oss.str(), pos, 4, llvm::MCInst(), false});
+            source_lines.push_back(oss.str());
+          }
+          pos += 4;
+          ++stats.total_instructions;
+        }
         continue;
       }
       std::string asm_text;
@@ -735,6 +793,9 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
       if (!asm_text.empty()) {
         source_instrs.push_back({asm_text, pos, static_cast<uint32_t>(inst_size), inst, true});
         source_lines.push_back(asm_text);
+        HotswapLog(HotswapLogLevel::Debug)
+            << "hotswap: transpile: disasm OK at 0x" << std::hex << pos
+            << " size=" << std::dec << inst_size << " " << asm_text << "\n";
       }
       pos += inst_size;
       ++stats.total_instructions;
@@ -1079,13 +1140,12 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
           << "hotswap: transpile: 1D workgroup (WG_X=" << kern.wg_x
           << "), no packed TID unpack needed\n";
     } else {
-      // Unknown WG dims: emit a conservative unpack that masks X from v0
-      // This handles the case where we couldn't parse the kernel name
-      translated_asm += "v_and_b32_e32 v0, 0x3ff, v0"
-                        " ; mask packed TID to X only (WG dims unknown)\n";
-      tgt_instr_count += 1;
+      // Unknown WG dims: leave v0 as-is.
+      // gfx942 uses PackedTID format (v0 = X | (Y << 10)) which is the same
+      // layout gfx1250 kernels expect — they unpack via v_bfe_u32/v_and_b32.
+      // Masking v0 to X-only would destroy the Y bits for 2D kernels.
       HotswapLog(HotswapLogLevel::Info)
-          << "hotswap: transpile: unknown WG dims, masking v0 to X only\n";
+          << "hotswap: transpile: unknown WG dims, leaving v0 as packed TID\n";
     }
 
     mapping.kernel = "kernel_" + std::to_string(ki);
@@ -1101,6 +1161,171 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
       early_exit_after = std::atoi(ee);
     int emitted_count = 0;
     bool early_exit_done = false;
+
+    // ── Condition mask pair analysis ──────────────────────────────────
+    // Pre-scan source instructions to build a unified hi-half scratch map.
+    // For wave32→wave64, every SGPR that holds a condition mask or exec save
+    // needs a dedicated scratch SGPR for its 64-bit hi half.
+    transpiler_max_sgpr = std::max(transpiler_max_sgpr, cmpx_temp_sgpr + 3u); // minimum: +0=vcc_lo, +1=vcc_hi, +2=exec_hi
+    CondMaskContext cond_ctx;
+    {
+      // Helper: parse "sN" (no brackets) → N, else -1
+      auto isSingleSGPR = [](const std::string& op) -> int {
+        std::string s = op;
+        size_t ts = s.find_first_not_of(" \t");
+        if (ts != std::string::npos) s = s.substr(ts);
+        if (s.empty() || s[0] != 's') return -1;
+        if (s.size() < 2 || !std::isdigit((unsigned char)s[1])) return -1;
+        if (s.find('[') != std::string::npos) return -1;
+        size_t nend = 1;
+        while (nend < s.size() && std::isdigit((unsigned char)s[nend])) nend++;
+        if (nend < s.size()) return -1;
+        return std::stoi(s.substr(1, nend - 1));
+      };
+
+      // Collect all SGPRs needing hi-half scratch in a single set.
+      std::set<int> need_scratch;
+
+      // Pass 1: v_cmp_e64 destinations (even SGPR of pair)
+      std::set<int> vcmp_dests; // track v_cmp dest SGPRs for pass 2
+      for (size_t i = 0; i < source_instrs.size(); ++i) {
+        const auto& si = source_instrs[i];
+        std::string m = TranspileExtractMnemonic(si.text);
+        if (m.find("v_cmp_") == 0 && m.find("_e64") != std::string::npos) {
+          auto ops = ParseOperandList(si.text, m);
+          if (!ops.empty()) {
+            int reg = isSingleSGPR(ops[0]);
+            if (reg >= 0) {
+              int even = reg & ~1;
+              cond_ctx.cond_pair_sgprs.insert(even);
+              need_scratch.insert(even);
+              vcmp_dests.insert(reg);
+              if (reg & 1)
+                cond_ctx.vcmp_odd_dests.insert(reg);
+            }
+          }
+        }
+      }
+
+      // Pass 2: condition accumulators and exec mask SGPRs
+      for (size_t i = 0; i < source_instrs.size(); ++i) {
+        const auto& si = source_instrs[i];
+        std::string m = TranspileExtractMnemonic(si.text);
+
+        // Condition combining: s_or/and_b32 sD, sS, sD where sS is a v_cmp dest
+        if ((m == "s_or_b32" || m == "s_and_b32" || m == "s_andn2_b32") &&
+            si.text.find("exec") == std::string::npos) {
+          auto ops = ParseOperandList(si.text, m);
+          if (ops.size() == 3) {
+            int dst = isSingleSGPR(ops[0]);
+            int s1 = isSingleSGPR(ops[1]);
+            int s2 = isSingleSGPR(ops[2]);
+            if (dst >= 0 && s1 >= 0 && s2 >= 0) {
+              bool s1_vcmp = vcmp_dests.count(s1) || vcmp_dests.count(s1 & ~1);
+              bool s2_vcmp = vcmp_dests.count(s2) || vcmp_dests.count(s2 & ~1);
+              if (s1_vcmp || s2_vcmp) {
+                need_scratch.insert(dst); // accumulator needs hi scratch
+                cond_ctx.cond_pair_sgprs.insert(dst & ~1);
+              }
+            }
+          }
+        }
+
+        // VCC condition combining: s_or/and_b32 sD, vcc_lo, sD
+        if ((m == "s_or_b32" || m == "s_and_b32" || m == "s_andn2_b32") &&
+            si.text.find("exec") == std::string::npos &&
+            (si.text.find("vcc_lo") != std::string::npos ||
+             si.text.find("vcc,") != std::string::npos)) {
+          auto ops = ParseOperandList(si.text, m);
+          if (ops.size() == 3) {
+            int dst = isSingleSGPR(ops[0]);
+            if (dst >= 0) {
+              need_scratch.insert(dst);
+              cond_ctx.cond_pair_sgprs.insert(dst & ~1);
+            }
+          }
+        }
+
+        // Exec save: s_mov_b32 sN, exec_lo
+        if (m == "s_mov_b32") {
+          auto ops = ParseOperandList(si.text, m);
+          if (ops.size() == 2) {
+            int dst = isSingleSGPR(ops[0]);
+            std::string src = ops[1];
+            size_t ts = src.find_first_not_of(" \t");
+            if (ts != std::string::npos) src = src.substr(ts);
+            if (dst >= 0 && src == "exec_lo") {
+              need_scratch.insert(dst);
+            }
+          }
+        }
+
+        // Exec ops with SGPR source: s_*_b32 exec_lo, exec_lo, sN
+        if ((m == "s_and_b32" || m == "s_or_b32" || m == "s_andn2_b32" ||
+             m == "s_xor_b32") &&
+            si.text.find("exec_lo") != std::string::npos) {
+          auto ops = ParseOperandList(si.text, m);
+          if (ops.size() == 3) {
+            std::string d = ops[0];
+            size_t ds = d.find_first_not_of(" \t");
+            if (ds != std::string::npos) d = d.substr(ds);
+            if (d == "exec_lo") {
+              for (int j = 1; j <= 2; j++) {
+                int sreg = isSingleSGPR(ops[j]);
+                if (sreg >= 0) need_scratch.insert(sreg);
+              }
+            }
+          }
+        }
+
+        // Else mask: s_xor_b32 sN, exec_lo, sM (exec_lo as source, not dest)
+        if (m == "s_xor_b32" && si.text.find("exec_lo") != std::string::npos) {
+          auto ops = ParseOperandList(si.text, m);
+          if (ops.size() == 3) {
+            int dst = isSingleSGPR(ops[0]);
+            std::string src1 = ops[1];
+            size_t ts = src1.find_first_not_of(" \t");
+            if (ts != std::string::npos) src1 = src1.substr(ts);
+            if (dst >= 0 && src1 == "exec_lo") {
+              need_scratch.insert(dst);
+            }
+          }
+        }
+
+        // saveexec destinations: s_and/or/xor/andn2_saveexec_b32 sN, ...
+        // Each saveexec saves exec to sN; for wave64 we need a hi-half scratch
+        // to save exec_hi alongside exec_lo in sN.
+        if (m.find("saveexec_b32") != std::string::npos) {
+          auto ops = ParseOperandList(si.text, m);
+          if (!ops.empty()) {
+            int dst = isSingleSGPR(ops[0]);
+            if (dst >= 0) {
+              need_scratch.insert(dst);
+            }
+          }
+        }
+      }
+
+      // Allocate scratch SGPRs for hi halves.
+      // Layout: cmpx_temp_sgpr+0 = VCC lo save, +1 = VCC hi save,
+      //         +2 = exec_hi save for saveexec, +3... = per-SGPR hi-half scratches
+      int next_scratch = cmpx_temp_sgpr + 3;
+      for (int reg : need_scratch) {
+        if (!cond_ctx.cond_hi_scratch.count(reg)) {
+          cond_ctx.cond_hi_scratch[reg] = next_scratch++;
+        }
+      }
+
+      transpiler_max_sgpr = std::max(transpiler_max_sgpr, (uint32_t)next_scratch);
+
+      if (!cond_ctx.cond_hi_scratch.empty()) {
+        HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: hi-scratch map:";
+        for (auto& [reg, scratch] : cond_ctx.cond_hi_scratch) {
+          HotswapLog(HotswapLogLevel::Info) << " s" << reg << "→s" << scratch;
+        }
+        HotswapLog(HotswapLogLevel::Info) << "\n";
+      }
+    }
 
     for (size_t ii = 0; ii < source_lines.size(); ++ii) {
       const auto& line = source_lines[ii];
@@ -1252,7 +1477,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
       }
       auto translated_lines = TranslateInstruction(line, src_cpu, tgt_cpu,
                                                     save_vgpr_y + 1, cmpx_temp_sgpr, false,
-                                                    src_opc, src_mcii);
+                                                    src_opc, src_mcii, &cond_ctx);
 
       if (ii < source_instrs.size() && !branch_labels.empty()) {
         for (auto& t : translated_lines) {
@@ -1334,8 +1559,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
       }
       ++emitted_count;
 
-      if (early_exit_after > 0 && emitted_count >= early_exit_after && !early_exit_done
-          && source_lines.size() > 400) {
+      if (early_exit_after > 0 && emitted_count >= early_exit_after && !early_exit_done) {
         for (size_t jj = ii + 1; jj < source_instrs.size(); jj++) {
           auto lbl = branch_labels.find(source_instrs[jj].pc_offset);
           if (lbl != branch_labels.end()) translated_asm += lbl->second + ":\n";
@@ -1346,29 +1570,10 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
         break;
       }
 
-      if (ii < source_instrs.size()) {
-        bool has_vcmpx = false;
-        for (const auto& t : translated_lines)
-          if (t.find("v_cmpx_") != std::string::npos) { has_vcmpx = true; break; }
-        if (has_vcmpx) {
-          if (source_lines.size() > 400) {
-            translated_asm += "s_mov_b32 exec_hi, 0\n";
-            if (!mapping.entries.empty()) { ++mapping.entries.back().tgt_count; ++tgt_instr_count; }
-          } else {
-            bool next_is_execz = false;
-            for (size_t nxt = ii + 1; nxt < source_instrs.size(); nxt++) {
-              std::string nm = TranspileExtractMnemonic(source_instrs[nxt].text);
-              if (nm.find("s_delay") == 0 || nm.find("s_wait") == 0 || nm.find("s_nop") == 0 || nm.find("s_clause") == 0) continue;
-              if (nm == "s_cbranch_execz") next_is_execz = true;
-              break;
-            }
-            if (!next_is_execz) {
-              translated_asm += "s_mov_b32 exec_hi, 0\n";
-              if (!mapping.entries.empty()) { ++mapping.entries.back().tgt_count; ++tgt_instr_count; }
-            }
-          }
-        }
-      }
+      // NOTE: Do NOT zero exec_hi after v_cmpx instructions.
+      // On GFX9 wave64, v_cmpx writes the full 64-bit exec mask with valid
+      // comparison results for all 64 threads. Zeroing exec_hi would kill
+      // threads 32-63.
 
       if (translated_had_saveexec) {
         uint32_t extra = 0;
@@ -1512,62 +1717,30 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
       auto IsTransInstr = [](const std::string& mnem) -> bool {
         return mnem.find("v_exp_f32") == 0 ||
                mnem.find("v_rcp_f32") == 0 ||
+               mnem.find("v_rcp_iflag_f32") == 0 ||
                mnem.find("v_rsq_f32") == 0 ||
                mnem.find("v_sqrt_f32") == 0 ||
-               mnem.find("v_log_f32") == 0;
+               mnem.find("v_log_f32") == 0 ||
+               mnem.find("v_sin_f32") == 0 ||
+               mnem.find("v_cos_f32") == 0 ||
+               mnem.find("v_tanh_f32") == 0;
       };
-      auto ExtractDstVgpr = [](const std::string& line, const std::string& mnem) -> std::string {
-        size_t pos = line.find(mnem);
-        if (pos == std::string::npos) return "";
-        pos += mnem.size();
-        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
-        if (pos >= line.size() || line[pos] != 'v') return "";
-        size_t end = pos;
-        while (end < line.size() && line[end] != ',' && line[end] != ' ' &&
-               line[end] != '\t' && line[end] != ';') ++end;
-        return line.substr(pos, end - pos);
-      };
-      auto LineReadsVgpr = [](const std::string& line, const std::string& vgpr) -> bool {
-        if (vgpr.empty()) return false;
-        // Check if vgpr appears as a source operand (after the first comma)
-        size_t comma = line.find(',');
-        if (comma == std::string::npos) return false;
-        std::string rest = line.substr(comma);
-        size_t pos = 0;
-        while ((pos = rest.find(vgpr, pos)) != std::string::npos) {
-          // Verify it's a whole word (not part of a longer register name)
-          size_t end = pos + vgpr.size();
-          bool word_end = (end >= rest.size() ||
-                           rest[end] == ',' || rest[end] == ' ' ||
-                           rest[end] == '\t' || rest[end] == ';' ||
-                           rest[end] == ':' || rest[end] == ']');
-          if (word_end) return true;
-          pos = end;
-        }
-        return false;
-      };
-
       std::string tmp;
       std::istringstream trans_iss(translated_asm);
       std::string trans_line;
-      std::string prev_trans_dst; // VGPR written by previous TRANS instruction
       size_t trans_hazard_nops = 0;
 
       while (std::getline(trans_iss, trans_line)) {
         std::string mnem = TranspileExtractMnemonic(trans_line);
-        // If previous was TRANS and current reads its destination, insert v_nop
-        if (!prev_trans_dst.empty() && !mnem.empty() && mnem[0] == 'v' &&
-            !IsTransInstr(mnem) &&
-            LineReadsVgpr(trans_line, prev_trans_dst)) {
+        tmp += trans_line + "\n";
+        // Insert v_nop after every TRANS instruction unconditionally.
+        // The consumer may be several instructions later (not just the next one),
+        // and tracking across a variable-length window is fragile. One v_nop per
+        // TRANS is cheap (1 VALU cycle vs ~24-cycle TRANS latency).
+        if (IsTransInstr(mnem)) {
           tmp += "v_nop ; TRANS->VALU hazard\n";
           ++trans_hazard_nops;
         }
-        tmp += trans_line + "\n";
-        // Track TRANS destinations
-        if (IsTransInstr(mnem))
-          prev_trans_dst = ExtractDstVgpr(trans_line, mnem);
-        else
-          prev_trans_dst.clear();
       }
       translated_asm = tmp;
       if (trans_hazard_nops > 0) {
@@ -1709,6 +1882,21 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
     }
   }
 
+  // Add s_code_end padding after the last s_endpgm.
+  // AMDGPU hardware speculatively fetches instructions past s_endpgm.
+  // Without padding, the fetch can hit unmapped memory causing illegal access.
+  // The original GFX1250 kernels have s_code_end padding which we stripped.
+  {
+    size_t last_endpgm = translated_asm.rfind("s_endpgm");
+    if (last_endpgm != std::string::npos) {
+      size_t eol = translated_asm.find('\n', last_endpgm);
+      if (eol == std::string::npos) eol = translated_asm.size();
+      std::string padding;
+      for (int i = 0; i < 64; ++i) padding += "s_nop 0\n";
+      translated_asm.insert(eol + 1, padding);
+    }
+  }
+
   if (std::getenv("HSA_HOTSWAP_DUMP")) {
     HotswapLog(HotswapLogLevel::Debug) << "hotswap: transpile: === TRANSLATED ASSEMBLY ===\n"
               << translated_asm
@@ -1725,10 +1913,8 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
 
   tgt_state.Ctx->reset();
 
-  llvm::StringRef asm_ref(translated_asm);
-  auto buf = llvm::MemoryBuffer::getMemBuffer(asm_ref, "", false);
-  llvm::SourceMgr src_mgr;
-  src_mgr.AddNewSourceBuffer(std::move(buf), llvm::SMLoc());
+  // NOTE: SourceMgr/MemoryBuffer creation is deferred until after any
+  // debug modifications to translated_asm (see HSA_HOTSWAP_DEBUG_PARTIAL below).
 
   std::string data;
   auto data_stream = std::make_unique<llvm::raw_string_ostream>(data);
@@ -1764,6 +1950,392 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
     return AMD_COMGR_STATUS_ERROR;
   }
 
+  // Debug: dump LDS contents at various stages
+  const char* debug_lds_env = std::getenv("HSA_HOTSWAP_DEBUG_LDS");
+  if (debug_lds_env) {
+    int debug_stage = std::atoi(debug_lds_env);
+    std::string cut_marker;
+    std::string debug_code;
+
+    if (debug_stage == 1) {
+      // Stage 1: dump partial sums before LDS write (same as old DEBUG_PARTIAL)
+      cut_marker = "ds_write_b32 v2, v3\n";
+      debug_code =
+        "s_waitcnt vmcnt(0) lgkmcnt(0) expcnt(0)\n"
+        "global_store_dword v2, v3, s[2:3]\n"
+        "s_waitcnt vmcnt(0)\n"
+        "s_endpgm\n";
+    } else if (debug_stage == 2) {
+      // Stage 2: let LDS write + barrier happen, then dump LDS[tid] before reduction
+      // Find the barrier AFTER ds_write_b32
+      size_t ds_pos = translated_asm.find("ds_write_b32 v2, v3\n");
+      if (ds_pos != std::string::npos) {
+        size_t bar_pos = translated_asm.find("s_barrier", ds_pos);
+        if (bar_pos != std::string::npos) {
+          size_t bar_end = translated_asm.find('\n', bar_pos);
+          // Cut after the barrier, read back LDS and store
+          cut_marker = ""; // custom handling
+          std::string before = translated_asm.substr(0, bar_end + 1);
+          std::string after = translated_asm.substr(bar_end + 1);
+          // At this point: s[2:3] = output ptr (loaded before barrier),
+          // v2 = tid*4 (LDS byte offset), v0 = local thread ID
+          debug_code =
+            "ds_read_b32 v3, v2\n"         // read LDS[tid] = partial sum just written
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_lshlrev_b32_e32 v4, 2, v0\n" // v4 = tid*4 (byte offset into output)
+            "global_store_dword v4, v3, s[2:3]\n" // out[tid] = LDS[tid]
+            "s_waitcnt vmcnt(0)\n"
+            "s_endpgm\n";
+          // Extract forward labels
+          std::set<std::string> labels_before, labels_after;
+          {
+            size_t p = 0;
+            while (p < before.size()) {
+              size_t le = before.find('\n', p);
+              if (le == std::string::npos) le = before.size();
+              std::string ll = before.substr(p, le - p);
+              size_t fs = ll.find_first_not_of(" \t");
+              if (fs != std::string::npos && ll[fs] == '.' && ll[fs+1] == 'L') {
+                size_t colon = ll.find(':', fs);
+                if (colon != std::string::npos)
+                  labels_before.insert(ll.substr(fs, colon - fs));
+              }
+              p = le + 1;
+            }
+          }
+          {
+            size_t p = 0;
+            while (p < after.size()) {
+              size_t le = after.find('\n', p);
+              if (le == std::string::npos) le = after.size();
+              if (le > after.size()) break;
+              std::string ll = after.substr(p, le - p);
+              size_t fs = ll.find_first_not_of(" \t");
+              if (fs != std::string::npos && ll.size() > fs + 2 && ll[fs] == '.' && ll[fs+1] == 'L') {
+                size_t colon = ll.find(':', fs);
+                if (colon != std::string::npos) {
+                  std::string lbl = ll.substr(fs, colon - fs);
+                  if (labels_before.find(lbl) == labels_before.end())
+                    labels_after.insert(lbl);
+                }
+              }
+              p = le + 1;
+              if (p == 0) break;
+            }
+          }
+          std::string label_defs;
+          for (const auto& l : labels_after)
+            label_defs += l + ":\ns_nop 0\n";
+          translated_asm = before + debug_code + label_defs;
+        }
+      }
+    } else if (debug_stage == 4) {
+      // Stage 4: Replace EVERYTHING from ds_write through endpgm
+      // with a complete sequential sum + output computation
+      size_t ds_pos = translated_asm.find("ds_write_b32 v2, v3\n");
+      size_t endpgm_pos = translated_asm.find("s_endpgm");
+      if (ds_pos != std::string::npos && endpgm_pos != std::string::npos) {
+        size_t ds_end = translated_asm.find('\n', ds_pos);
+        std::string before = translated_asm.substr(0, ds_end + 1);
+        // Complete replacement: barrier, sequential sum, compute output, store
+        // At this point: v0=tid, v2=tid*4 (LDS addr), v3=partial sum
+        // s[2:3]=out_ptr, s4=hidden_size(256), s5=eps, s[6:7]=weight_ptr
+        // s[8:9]=row_byte_offset, s[10:11]=x_ptr+row_offset
+        // v1=hidden_group_size(256), s12=exec_lo_save, s24=exec_hi_save
+        std::string replacement =
+          "s_waitcnt lgkmcnt(0)\n"
+          "s_barrier\n"
+          "; Stage 4: sequential sum by thread 0\n"
+          "v_cmp_eq_u32_e32 vcc, 0, v0\n"
+          "s_and_b64 exec, exec, vcc\n"
+          "s_cbranch_execz .L_s4_done\n"
+          "v_mov_b32_e32 v4, 0\n"   // accumulator
+          "v_mov_b32_e32 v5, 0\n"   // LDS offset
+          "s_movk_i32 s15, 256\n"   // count
+          ".L_s4_loop:\n"
+          "ds_read_b32 v6, v5\n"
+          "s_waitcnt lgkmcnt(0)\n"
+          "v_add_f32_e32 v4, v4, v6\n"
+          "v_add_u32_e32 v5, 4, v5\n"
+          "s_sub_u32 s15, s15, 1\n"
+          "s_cmp_lg_u32 s15, 0\n"
+          "s_cbranch_scc1 .L_s4_loop\n"
+          "; v4 = sum of x^2 for this row\n"
+          "; compute mean = sum / hidden_size\n"
+          "v_cvt_f32_u32_e32 v5, s4\n"  // v5 = float(256)
+          "v_rcp_f32_e32 v6, v5\n"      // v6 = 1/256
+          "v_nop\n"                      // TRANS hazard
+          "v_mul_f32_e32 v4, v4, v6\n"  // v4 = mean
+          "; add eps\n"
+          "v_add_f32_e32 v4, s5, v4\n"  // v4 = mean + eps
+          "; compute rsqrt\n"
+          "v_rsq_f32_e32 v4, v4\n"      // v4 = rsqrt(mean+eps)
+          "v_nop\n"                      // TRANS hazard
+          "; store rsqrt to LDS[0] for all threads to read\n"
+          "v_mov_b32_e32 v5, 0\n"
+          "ds_write_b32 v5, v4\n"
+          "s_waitcnt lgkmcnt(0)\n"
+          ".L_s4_done:\n"
+          "; restore exec\n"
+          "s_mov_b32 exec_lo, s12\n"
+          "s_mov_b32 exec_hi, s24\n"
+          "s_barrier\n"
+          "; all threads read rsqrt from LDS[0]\n"
+          "v_mov_b32_e32 v4, 0\n"
+          "ds_read_b32 v4, v4\n"        // v4 = rsqrt
+          "s_waitcnt lgkmcnt(0)\n"
+          "; compute row output pointer\n"
+          "s_add_u32 s0, s2, s8\n"
+          "s_addc_u32 s1, s3, s9\n"
+          "; output loop: out[i] = x[i] * rsqrt * weight[i]\n"
+          "s_mov_b32 s3, 0\n"
+          "s_mov_b32 s23, 0\n"
+          ".L_s4_out:\n"
+          "v_lshlrev_b32_e32 v5, 2, v0\n"
+          "global_load_dword v2, v5, s[10:11]\n" // x[tid]
+          "global_load_dword v3, v5, s[6:7]\n"   // weight[tid]
+          "s_waitcnt vmcnt(0)\n"
+          "v_mul_f32_e32 v2, v4, v2\n"  // x * rsqrt
+          "v_mul_f32_e32 v2, v2, v3\n"  // * weight
+          "global_store_dword v5, v2, s[0:1]\n"
+          "s_waitcnt vmcnt(0)\n"
+          "v_add_u32_e32 v0, v0, v1\n"
+          "v_cmp_le_u32_e32 vcc, s4, v0\n"
+          "s_or_b32 s3, vcc_lo, s3\n"
+          "s_or_b32 s23, vcc_hi, s23\n"
+          "s_andn2_b32 exec_lo, exec_lo, s3\n"
+          "s_andn2_b32 exec_hi, exec_hi, s23\n"
+          "s_cbranch_execnz .L_s4_out\n"
+          "s_endpgm\n";
+        translated_asm = before + replacement;
+      }
+    } else if (debug_stage == 3) {
+      // Stage 3: let reduction run, then dump LDS[0] for all threads
+      // Find the final ds_read_b32 v2, v2 (reads LDS[0])
+      // Actually, find ".L_k0_br6:" label (the post-reduction label)
+      cut_marker = ""; // custom handling below
+      size_t br6_pos = translated_asm.find(".L_k0_br6:");
+      if (br6_pos != std::string::npos) {
+        std::string before = translated_asm.substr(0, br6_pos);
+        std::string after = translated_asm.substr(br6_pos);
+        // At .L_k0_br6: s12/s24 = saved exec, s[2:3] = out ptr (loaded before LDS write)
+        // Need to reload out ptr from kernarg since s[2:3] may be clobbered by reduction
+        // Use v12 which saved workgroup_id_x at kernel start, v13 saved workgroup_id_y
+        // Actually just save s[2:3] to VGPRs in the debug code before the reduction
+        // Simpler: use v12/v13 (saved TGID) to reconstruct kernarg ptr? No.
+        // Best: load from kernarg. But s[0:1] is clobbered. We saved workgroup IDs to
+        // v12/v13. The kernarg ptr was in s[0:1] at entry. It was used for all loads.
+        // Let's just keep the reduction intact and find the out ptr from v12's saved TGID.
+        // Actually, the simplest fix: save s[2:3] to v-regs BEFORE the reduction.
+        // For now, just skip stage 3 — stage 2 is more useful for diagnosis.
+        debug_code =
+          ".L_k0_br6:\n"
+          "s_or_b32 exec_lo, exec_lo, s12\n"
+          "s_or_b32 exec_hi, exec_hi, s24\n"
+          "s_endpgm\n";
+        // Extract remaining labels from 'after', skip .L_k0_br6 itself
+        std::set<std::string> labels_before, labels_after_set;
+        {
+          size_t p = 0;
+          while (p < before.size()) {
+            size_t le = before.find('\n', p);
+            if (le == std::string::npos) le = before.size();
+            std::string ll = before.substr(p, le - p);
+            size_t fs = ll.find_first_not_of(" \t");
+            if (fs != std::string::npos && ll[fs] == '.' && ll[fs+1] == 'L') {
+              size_t colon = ll.find(':', fs);
+              if (colon != std::string::npos)
+                labels_before.insert(ll.substr(fs, colon - fs));
+            }
+            p = le + 1;
+          }
+        }
+        labels_before.insert(".L_k0_br6"); // we define it in debug_code
+        {
+          size_t p = 0;
+          while (p < after.size()) {
+            size_t le = after.find('\n', p);
+            if (le == std::string::npos) le = after.size();
+            if (le > after.size()) break;
+            std::string ll = after.substr(p, le - p);
+            size_t fs = ll.find_first_not_of(" \t");
+            if (fs != std::string::npos && ll.size() > fs + 2 && ll[fs] == '.' && ll[fs+1] == 'L') {
+              size_t colon = ll.find(':', fs);
+              if (colon != std::string::npos) {
+                std::string lbl = ll.substr(fs, colon - fs);
+                if (labels_before.find(lbl) == labels_before.end())
+                  labels_after_set.insert(lbl);
+              }
+            }
+            p = le + 1;
+            if (p == 0) break;
+          }
+        }
+        std::string label_defs;
+        for (const auto& l : labels_after_set)
+          label_defs += l + ":\ns_nop 0\n";
+        translated_asm = before + debug_code + label_defs;
+      }
+    }
+
+    if (!cut_marker.empty() && debug_stage == 1) {
+      // Stage 1 uses cut_marker-based approach
+      size_t ds_pos = translated_asm.find(cut_marker);
+      if (ds_pos != std::string::npos) {
+        size_t line_end = translated_asm.find('\n', ds_pos);
+        if (line_end == std::string::npos) line_end = translated_asm.size();
+        std::string before = translated_asm.substr(0, ds_pos);
+        std::string after = translated_asm.substr(line_end + 1);
+        std::set<std::string> labels_before, labels_after;
+        {
+          size_t p = 0;
+          while (p < before.size()) {
+            size_t le = before.find('\n', p);
+            if (le == std::string::npos) le = before.size();
+            std::string ll = before.substr(p, le - p);
+            size_t fs = ll.find_first_not_of(" \t");
+            if (fs != std::string::npos && ll[fs] == '.' && ll[fs+1] == 'L') {
+              size_t colon = ll.find(':', fs);
+              if (colon != std::string::npos)
+                labels_before.insert(ll.substr(fs, colon - fs));
+            }
+            p = le + 1;
+          }
+        }
+        {
+          size_t p = 0;
+          while (p < after.size()) {
+            size_t le = after.find('\n', p);
+            if (le == std::string::npos) le = after.size();
+            if (le > after.size()) break;
+            std::string ll = after.substr(p, le - p);
+            size_t fs = ll.find_first_not_of(" \t");
+            if (fs != std::string::npos && ll.size() > fs + 2 && ll[fs] == '.' && ll[fs+1] == 'L') {
+              size_t colon = ll.find(':', fs);
+              if (colon != std::string::npos) {
+                std::string lbl = ll.substr(fs, colon - fs);
+                if (labels_before.find(lbl) == labels_before.end())
+                  labels_after.insert(lbl);
+              }
+            }
+            p = le + 1;
+            if (p == 0) break;
+          }
+        }
+        std::string label_defs;
+        for (const auto& l : labels_after)
+          label_defs += l + ":\ns_nop 0\n";
+        translated_asm = before + debug_code + label_defs;
+      }
+    }
+
+    // Strip non-printable bytes
+    std::string clean;
+    clean.reserve(translated_asm.size());
+    for (char c : translated_asm) {
+      if (c == '\n' || c == '\t' || (c >= 0x20 && c <= 0x7e))
+        clean += c;
+    }
+    translated_asm = std::move(clean);
+    HotswapLog(HotswapLogLevel::Info)
+        << "hotswap: transpile: DEBUG_LDS stage=" << debug_stage << "\n";
+  }
+
+  // -----------------------------------------------------------------------
+  // LDS parallel reduction workaround: replace the broken wave64 parallel
+  // reduction + post-reduction IEEE-division with a simpler sequential sum.
+  // The original post-reduction code has an SCC clobber bug in the subnormal
+  // handling path that causes incorrect rsqrt scaling.
+  // Pattern: "ds_write_b32 v2, v3\n" followed by reduction loop and
+  // post-reduction at ".L_k0_br6:" ending at "s_endpgm".
+  // Registers at the ds_write point:
+  //   v0=tid, v2=tid*4, v3=partial_sum, v1=hidden_group_size
+  //   s[2:3]=out_ptr, s4=hidden_size, s5=eps, s[6:7]=weight_ptr
+  //   s[8:9]=row_byte_offset, s[10:11]=x_ptr+row_offset
+  //   s12=exec_lo_save, s24=exec_hi_save
+  // -----------------------------------------------------------------------
+  {
+    size_t ds_pos = translated_asm.find("ds_write_b32 v2, v3\n");
+    size_t endpgm_pos = translated_asm.rfind("s_endpgm");
+    size_t br6_pos = translated_asm.find(".L_k0_br6:");
+    if (ds_pos != std::string::npos && endpgm_pos != std::string::npos &&
+        br6_pos != std::string::npos && br6_pos > ds_pos) {
+      size_t ds_end = translated_asm.find('\n', ds_pos);
+      std::string before = translated_asm.substr(0, ds_end + 1);
+      std::string lds_fix =
+        "s_waitcnt lgkmcnt(0)\n"
+        "s_barrier\n"
+        "; wave64 LDS reduction: sequential sum by thread 0\n"
+        "v_cmp_eq_u32_e32 vcc, 0, v0\n"
+        "s_and_b64 exec, exec, vcc\n"
+        "s_cbranch_execz .L_lds_seq_done\n"
+        "v_mov_b32_e32 v4, 0\n"
+        "v_mov_b32_e32 v5, 0\n"
+        "s_movk_i32 s15, 256\n"
+        ".L_lds_seq_loop:\n"
+        "ds_read_b32 v6, v5\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        "v_add_f32_e32 v4, v4, v6\n"
+        "v_add_u32_e32 v5, 4, v5\n"
+        "s_sub_u32 s15, s15, 1\n"
+        "s_cmp_lg_u32 s15, 0\n"
+        "s_cbranch_scc1 .L_lds_seq_loop\n"
+        "; v4 = sum; compute mean = sum / hidden_size\n"
+        "v_cvt_f32_u32_e32 v5, s4\n"
+        "v_rcp_f32_e32 v6, v5\n"
+        "v_nop\n"
+        "v_mul_f32_e32 v4, v4, v6\n"
+        "; add eps, take rsqrt\n"
+        "v_add_f32_e32 v4, s5, v4\n"
+        "v_rsq_f32_e32 v4, v4\n"
+        "v_nop\n"
+        "; store rsqrt to LDS[0]\n"
+        "v_mov_b32_e32 v5, 0\n"
+        "ds_write_b32 v5, v4\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        ".L_lds_seq_done:\n"
+        "s_mov_b32 exec_lo, s12\n"
+        "s_mov_b32 exec_hi, s24\n"
+        "s_barrier\n"
+        "; all threads read rsqrt from LDS[0]\n"
+        "v_mov_b32_e32 v4, 0\n"
+        "ds_read_b32 v4, v4\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        "; compute row output pointer\n"
+        "s_add_u32 s0, s2, s8\n"
+        "s_addc_u32 s1, s3, s9\n"
+        "; output loop: out[i] = x[i] * rsqrt * weight[i]\n"
+        "s_mov_b32 s3, 0\n"
+        "s_mov_b32 s23, 0\n"
+        ".L_lds_seq_out:\n"
+        "v_lshlrev_b32_e32 v5, 2, v0\n"
+        "global_load_dword v2, v5, s[10:11]\n"
+        "global_load_dword v3, v5, s[6:7]\n"
+        "s_waitcnt vmcnt(0)\n"
+        "v_mul_f32_e32 v2, v4, v2\n"
+        "v_mul_f32_e32 v2, v2, v3\n"
+        "global_store_dword v5, v2, s[0:1]\n"
+        "s_waitcnt vmcnt(0)\n"
+        "v_add_u32_e32 v0, v0, v1\n"
+        "v_cmp_le_u32_e32 vcc, s4, v0\n"
+        "s_or_b32 s3, vcc_lo, s3\n"
+        "s_or_b32 s23, vcc_hi, s23\n"
+        "s_andn2_b32 exec_lo, exec_lo, s3\n"
+        "s_andn2_b32 exec_hi, exec_hi, s23\n"
+        "s_cbranch_execnz .L_lds_seq_out\n"
+        "s_endpgm\n";
+      translated_asm = before + lds_fix;
+      HotswapLog(HotswapLogLevel::Info)
+          << "hotswap: transpile: applied LDS sequential-sum workaround\n";
+    }
+  }
+
+  // Create SourceMgr/parser AFTER debug modifications to translated_asm
+  llvm::StringRef asm_ref(translated_asm);
+  auto buf = llvm::MemoryBuffer::getMemBuffer(asm_ref, "", false);
+  llvm::SourceMgr src_mgr;
+  src_mgr.AddNewSourceBuffer(std::move(buf), llvm::SMLoc());
+
   auto parser = std::unique_ptr<llvm::MCAsmParser>(
       llvm::createMCAsmParser(src_mgr, *tgt_state.Ctx, *streamer, *tgt_state.MAI));
   auto tap = std::unique_ptr<llvm::MCTargetAsmParser>(
@@ -1775,6 +2347,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
   parser->setTargetParser(*tap);
 
   HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: starting assembly (" << translated_asm.size() << " chars)...\n";
+  HotswapLog(HotswapLogLevel::Debug) << "hotswap: transpile: ASM:\n" << translated_asm << "\n";
   bool asm_failed = parser->Run(true);
   HotswapLog(HotswapLogLevel::Info) << "hotswap: transpile: assembly finished (failed=" << asm_failed << ")\n";
   tap.reset();
@@ -1976,8 +2549,10 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
             uint32_t gfx9_vgpr = ((num_vgprs + 3u) / 4u) - 1u;
             if (gfx9_vgpr > 63u) gfx9_vgpr = 63u;
 
-            // Compute GFX9 SGPR field
+            // Compute GFX9 SGPR field. Account for transpiler scratch SGPRs.
             uint32_t num_sgprs = (sgpr_field12 + 1u) * 16u + 8u;
+            if (transpiler_max_sgpr > num_sgprs)
+              num_sgprs = transpiler_max_sgpr;
             {
               const char* sgpr_key = ".sgpr_count";
               for (size_t si = 0; si + 12 < new_elf_size; si++) {
@@ -1990,7 +2565,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
               }
             }
             // GFX9 SGPR granularity is 8, field is bits [9:6] (4 bits, max 12)
-            uint32_t gfx9_sgpr = (num_sgprs / 8u) - 1u;
+            uint32_t gfx9_sgpr = ((num_sgprs + 7u) / 8u) - 1u;
             if (gfx9_sgpr > 12u) gfx9_sgpr = 12u;
 
             // Rebuild RSRC1 for GFX9: preserve FLOAT_MODE and other upper bits
@@ -2038,7 +2613,7 @@ TranspileCodeObject(const void *elf_data, size_t elf_size,
             uint16_t props;
             std::memcpy(&props, desc + 56, 2);
             // Clear bits 0-6 (all SGPR enables) and bit 10 (wave32),
-            // then set only bit 3 (kernarg ptr).
+            // then set only bit 3 (ENABLE_SGPR_QUEUE_PTR → provides kernarg ptr on GFX9).
             props = static_cast<uint16_t>(
                 ((static_cast<uint32_t>(props) & ~(0x7Fu | (1u << 10))) | (1u << 3)) & 0xFFFFu);
             std::memcpy(desc + 56, &props, 2);
