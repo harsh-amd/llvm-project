@@ -8,7 +8,7 @@ the code object.
 This directory ships two COMGR-side pieces:
 
 - The `amd_comgr_hotswap_rewrite` API, which applies stepping-specific patches
-  to a single code object.
+  and optional entry trampolines to a single code object.
 - The transpiler, a raiser-based path for the heavier cross-ISA case. It is
   documented at the bottom of this file.
 
@@ -27,7 +27,10 @@ HSA_TOOLS_LIB=/opt/rocm/lib/libhsa-hotswap.so ./my_app
 
 `HSA_TOOLS_LIB` tells `libhsa-runtime` what tool to hand each code object to
 before dispatch. The rocm-systems tool rewrites gfx1250 A0 loads for the
-B0-to-A0 stepping patches. Everything else passes through unchanged.
+B0-to-A0 stepping patches. If `AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES=1` is set,
+the tool also asks COMGR to redirect gfx1250 kernel descriptor entries through
+entry stubs, independent of the detected A0/B0 revision. Everything else passes
+through unchanged.
 
 If a rewrite fails, the runtime tool logs the failure and forwards the original
 code object. The application still runs, just without the rewrite applied.
@@ -47,8 +50,9 @@ GPUs is not supported.
 
 | Variable                   | Effect                                                        |
 | -------------------------- | ------------------------------------------------------------- |
-| `HSA_TOOLS_LIB`            | Standard HSA hook. Set it to rocm-systems' `libhsa-hotswap.so` to load the runtime tool. |
-| `HSA_HOTSWAP_TOOL_VERBOSE` | rocm-systems runtime-tool diagnostic logging, when supported by that tool. |
+| `HSA_TOOLS_LIB`                         | Standard HSA hook. Set it to rocm-systems' `libhsa-hotswap.so` to load the runtime tool. |
+| `AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES`   | Set to `1` to redirect gfx1250 kernel descriptor entries through COMGR-generated entry stubs, independent of A0/B0 stepping. Off by default. |
+| `HSA_HOTSWAP_TOOL_VERBOSE`              | rocm-systems runtime-tool diagnostic logging, when supported by that tool. |
 
 ## Transpiler (cross-gen)
 

@@ -197,6 +197,16 @@ static unsigned resolveOpcodeViaParse(StringRef AsmSnippet,
   return Parsed[0].getOpcode();
 }
 
+static bool resolveRequiredOpcode(StringRef AsmSnippet, StringRef Name,
+                                  LLVMState &S, unsigned &OutOpcode) {
+  OutOpcode = resolveOpcodeViaParse(AsmSnippet, S);
+  if (OutOpcode < S.MCII->getNumOpcodes())
+    return true;
+  log() << "hotswap: error: initLLVM: failed to resolve '" << Name
+        << "' opcode via asm parser for CPU '" << S.Cpu << "'.\n";
+  return false;
+}
+
 // -- LLVM MC target init ------------------------------------------------------
 
 LLVMState initLLVM(const TargetIdentifier &TI) {
@@ -312,6 +322,21 @@ LLVMState initLLVM(const TargetIdentifier &TI) {
     return S;
   }
   S.VNopInst = VNopInsts[0];
+
+  if (!resolveRequiredOpcode("global_wb", "global_wb", S, S.GlobalWbOpcode))
+    return S;
+  if (!resolveRequiredOpcode("s_get_pc_i64 s[100:101]", "s_get_pc_i64", S,
+                             S.SGetPcI64Opcode))
+    return S;
+  if (!resolveRequiredOpcode("s_add_u32 s100, s100, 0", "s_add_u32", S,
+                             S.SAddU32Opcode))
+    return S;
+  if (!resolveRequiredOpcode("s_addc_u32 s101, s101, 0", "s_addc_u32", S,
+                             S.SAddcU32Opcode))
+    return S;
+  if (!resolveRequiredOpcode("s_set_pc_i64 s[100:101]", "s_set_pc_i64", S,
+                             S.SSetPcI64Opcode))
+    return S;
 
   S.Valid = true;
   return S;

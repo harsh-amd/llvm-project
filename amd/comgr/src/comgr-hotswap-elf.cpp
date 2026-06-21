@@ -18,6 +18,8 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/MsgPackDocument.h"
 
+#include <algorithm>
+
 using namespace llvm;
 
 namespace COMGR {
@@ -202,6 +204,110 @@ uint8_t *ElfView::findKernelDescriptor(StringRef KernelName) {
     }
   }
   return nullptr;
+}
+
+// -- ElfView::kernelDescriptors -----------------------------------------------
+
+std::vector<KernelDescriptorInfo> ElfView::kernelDescriptors() const {
+  namespace hsa = amdhsa;
+  std::vector<KernelDescriptorInfo> Result;
+
+  for (const ELFT::Shdr &SymShdr : Sections) {
+    if (SymShdr.sh_type != ELF::SHT_SYMTAB &&
+        SymShdr.sh_type != ELF::SHT_DYNSYM)
+      continue;
+
+    Expected<ELFT::SymRange> SymsOrErr = File.symbols(&SymShdr);
+    if (!SymsOrErr) {
+      log() << "hotswap: error: kernelDescriptors: failed to read symbols: "
+            << toString(SymsOrErr.takeError()) << "\n";
+      continue;
+    }
+    Expected<StringRef> StrTabOrErr =
+        File.getStringTableForSymtab(SymShdr, Sections);
+    if (!StrTabOrErr) {
+      log() << "hotswap: error: kernelDescriptors: failed to read symbol "
+            << "string table: " << toString(StrTabOrErr.takeError()) << "\n";
+      continue;
+    }
+
+    for (const ELFT::Sym &Sym : *SymsOrErr) {
+      Expected<StringRef> NameOrErr = Sym.getName(*StrTabOrErr);
+      if (!NameOrErr) {
+        log() << "hotswap: error: kernelDescriptors: failed to read symbol "
+              << "name: " << toString(NameOrErr.takeError()) << "\n";
+        continue;
+      }
+      if (!NameOrErr->ends_with(".kd"))
+        continue;
+
+      Expected<const ELFT::Shdr *> HostShdrOrErr =
+          File.getSection(Sym.st_shndx);
+      if (!HostShdrOrErr) {
+        log() << "hotswap: error: kernelDescriptors: descriptor symbol '"
+              << *NameOrErr << "' has unreadable section index " << Sym.st_shndx
+              << ": " << toString(HostShdrOrErr.takeError()) << "\n";
+        continue;
+      }
+      const ELFT::Shdr &HostShdr = **HostShdrOrErr;
+      if (Sym.st_value < HostShdr.sh_addr) {
+        log() << "hotswap: error: kernelDescriptors: descriptor symbol '"
+              << *NameOrErr << "' has vaddr 0x" << utohexstr(Sym.st_value)
+              << " before containing section vaddr 0x"
+              << utohexstr(HostShdr.sh_addr) << ".\n";
+        continue;
+      }
+      uint64_t FileOffset =
+          HostShdr.sh_offset + (Sym.st_value - HostShdr.sh_addr);
+      if (FileOffset + KdSize > size()) {
+        log() << "hotswap: error: kernelDescriptors: descriptor symbol '"
+              << *NameOrErr << "' extends past end of ELF at file offset 0x"
+              << utohexstr(FileOffset) << ".\n";
+        continue;
+      }
+
+      int64_t EntryOffset = 0;
+      std::memcpy(
+          &EntryOffset,
+          data() + FileOffset +
+              offsetof(hsa::kernel_descriptor_t, kernel_code_entry_byte_offset),
+          sizeof(EntryOffset));
+
+      std::string KernelName = NameOrErr->drop_back(3).str();
+      const bool Seen = std::any_of(
+          Result.begin(), Result.end(), [&](const KernelDescriptorInfo &Info) {
+            return Info.KernelName == KernelName && Info.VAddr == Sym.st_value;
+          });
+      if (!Seen)
+        Result.push_back({std::move(KernelName), Sym.st_value, EntryOffset});
+    }
+  }
+
+  return Result;
+}
+
+std::optional<uint64_t>
+ElfView::getKernelDescriptorVAddr(StringRef KernelName) const {
+  for (const KernelDescriptorInfo &Info : kernelDescriptors()) {
+    if (Info.KernelName == KernelName)
+      return Info.VAddr;
+  }
+  return std::nullopt;
+}
+
+bool ElfView::updateKernelDescriptorEntryOffset(StringRef KernelName,
+                                                int64_t NewEntryOffset) {
+  namespace hsa = amdhsa;
+  uint8_t *Kd = findKernelDescriptor(KernelName);
+  if (!Kd) {
+    log() << "hotswap: error: updateKernelDescriptorEntryOffset: kernel "
+          << "descriptor symbol '" << KernelName << ".kd' not found.\n";
+    return false;
+  }
+  std::memcpy(
+      Kd + offsetof(hsa::kernel_descriptor_t, kernel_code_entry_byte_offset),
+      &NewEntryOffset, sizeof(NewEntryOffset));
+  return true;
 }
 
 // -- ElfView::getKernelVgprCount ----------------------------------------------
@@ -471,6 +577,102 @@ static void adjustProgramHeaders(uint8_t *Elf, size_t ElfSize,
   }
 }
 
+static uint8_t *sectionHeaderAt(uint8_t *Elf, size_t ElfSize, uint64_t Shoff,
+                                uint16_t Shentsize, uint16_t Index) {
+  uint64_t Pos = Shoff + static_cast<uint64_t>(Index) * Shentsize;
+  if (Pos + sizeof(Shdr) > ElfSize)
+    return nullptr;
+  return Elf + Pos;
+}
+
+static void adjustSymbolValues(uint8_t *Elf, size_t ElfSize,
+                               uint64_t TextOffset, size_t TrampTotal) {
+  if (TrampTotal == 0)
+    return;
+  if (ElfSize < sizeof(Ehdr)) {
+    log() << "hotswap: error: adjustSymbolValues: ELF size " << ElfSize
+          << " is smaller than ELF64 header size " << sizeof(Ehdr) << ".\n";
+    return;
+  }
+
+  uint16_t EType;
+  uint64_t Shoff;
+  uint16_t Shentsize;
+  uint16_t Shnum;
+  std::memcpy(&EType, Elf + offsetof(Ehdr, e_type), sizeof(EType));
+  std::memcpy(&Shoff, Elf + offsetof(Ehdr, e_shoff), sizeof(Shoff));
+  std::memcpy(&Shentsize, Elf + offsetof(Ehdr, e_shentsize), sizeof(Shentsize));
+  std::memcpy(&Shnum, Elf + offsetof(Ehdr, e_shnum), sizeof(Shnum));
+  if (EType == ELF::ET_REL)
+    return;
+  if (Shentsize < sizeof(Shdr)) {
+    log() << "hotswap: error: adjustSymbolValues: section header entry size "
+          << Shentsize << " is smaller than ELF64 section header size "
+          << sizeof(Shdr) << ".\n";
+    return;
+  }
+
+  for (uint16_t I = 0; I < Shnum; ++I) {
+    uint8_t *SymSh = sectionHeaderAt(Elf, ElfSize, Shoff, Shentsize, I);
+    if (!SymSh) {
+      log() << "hotswap: error: adjustSymbolValues: section header " << I
+            << " is outside the ELF buffer.\n";
+      break;
+    }
+
+    uint32_t ShType;
+    uint64_t ShOffset;
+    uint64_t ShSize;
+    uint64_t ShEntSize;
+    std::memcpy(&ShType, SymSh + offsetof(Shdr, sh_type), sizeof(ShType));
+    if (ShType != ELF::SHT_SYMTAB && ShType != ELF::SHT_DYNSYM)
+      continue;
+    std::memcpy(&ShOffset, SymSh + offsetof(Shdr, sh_offset), sizeof(ShOffset));
+    std::memcpy(&ShSize, SymSh + offsetof(Shdr, sh_size), sizeof(ShSize));
+    std::memcpy(&ShEntSize, SymSh + offsetof(Shdr, sh_entsize),
+                sizeof(ShEntSize));
+    if (ShEntSize < sizeof(ELF::Elf64_Sym) || ShOffset > ElfSize ||
+        ShSize > ElfSize - ShOffset) {
+      log() << "hotswap: error: adjustSymbolValues: symbol table section " << I
+            << " has invalid offset/size/entry size.\n";
+      continue;
+    }
+
+    for (uint64_t Off = ShOffset;
+         Off + sizeof(ELF::Elf64_Sym) <= ShOffset + ShSize; Off += ShEntSize) {
+      uint8_t *Sym = Elf + Off;
+      uint16_t Shndx;
+      std::memcpy(&Shndx, Sym + offsetof(ELF::Elf64_Sym, st_shndx),
+                  sizeof(Shndx));
+      if (Shndx == ELF::SHN_UNDEF || Shndx >= ELF::SHN_LORESERVE)
+        continue;
+      uint8_t *DefSh = sectionHeaderAt(Elf, ElfSize, Shoff, Shentsize, Shndx);
+      if (!DefSh) {
+        log() << "hotswap: error: adjustSymbolValues: symbol at file offset 0x"
+              << utohexstr(Off) << " references missing section " << Shndx
+              << ".\n";
+        continue;
+      }
+
+      uint64_t DefFlags;
+      uint64_t DefOffset;
+      std::memcpy(&DefFlags, DefSh + offsetof(Shdr, sh_flags),
+                  sizeof(DefFlags));
+      std::memcpy(&DefOffset, DefSh + offsetof(Shdr, sh_offset),
+                  sizeof(DefOffset));
+      if (!(DefFlags & ELF::SHF_ALLOC) || DefOffset <= TextOffset)
+        continue;
+
+      uint64_t Value;
+      std::memcpy(&Value, Sym + offsetof(ELF::Elf64_Sym, st_value),
+                  sizeof(Value));
+      Value += TrampTotal;
+      std::memcpy(Sym + offsetof(ELF::Elf64_Sym, st_value), &Value,
+                  sizeof(Value));
+    }
+  }
+}
+
 // -- ElfView::growWithTrampolines ---------------------------------------------
 
 std::unique_ptr<WritableMemoryBuffer>
@@ -547,6 +749,7 @@ ElfView::growWithTrampolines(ArrayRef<Trampoline> Trampolines,
                        PaddedTrampTotal);
   adjustProgramHeaders(Out, NewSize, textOffset(), textSize(),
                        PaddedTrampTotal);
+  adjustSymbolValues(Out, NewSize, textOffset(), PaddedTrampTotal);
   log() << "hotswap: growWithTrampolines: grew ELF from " << InputSize << " to "
         << NewSize << " bytes (" << Trampolines.size() << " trampoline"
         << (Trampolines.size() == 1 ? "" : "s") << ", " << TrampTotal

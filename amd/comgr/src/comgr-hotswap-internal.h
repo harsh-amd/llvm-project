@@ -81,6 +81,16 @@ struct Trampoline {
   llvm::SmallVector<uint8_t> Bytes;
 };
 
+// Kernel-entry stubs are appended as normal .text growth. Keep each entry on
+// the same 256-byte alignment expected by AMDGPU kernel descriptors.
+static constexpr uint64_t KernelEntryStubStride = 256;
+
+struct KernelDescriptorInfo {
+  std::string KernelName;
+  uint64_t VAddr = 0;
+  int64_t EntryOffset = 0;
+};
+
 struct NopSled {
   uint64_t Start = 0;
   uint64_t End = 0;
@@ -188,6 +198,19 @@ public:
   /// Pointer to the kernel_descriptor for \p KernelName inside the buffer,
   /// or nullptr if not found.
   uint8_t *findKernelDescriptor(llvm::StringRef KernelName);
+
+  /// Enumerate kernel descriptor symbols named "<kernel>.kd" and read their
+  /// current kernel_code_entry_byte_offset values.
+  std::vector<KernelDescriptorInfo> kernelDescriptors() const;
+
+  /// Return the virtual address of the kernel descriptor symbol for
+  /// \p KernelName, or std::nullopt when the descriptor is not present.
+  std::optional<uint64_t>
+  getKernelDescriptorVAddr(llvm::StringRef KernelName) const;
+
+  /// Rewrite kernel_code_entry_byte_offset for \p KernelName.
+  bool updateKernelDescriptorEntryOffset(llvm::StringRef KernelName,
+                                         int64_t NewEntryOffset);
 
   /// Read the VGPR count from the kernel descriptor for \p KernelName.
   /// Returns std::nullopt if the descriptor is not found.
@@ -335,6 +358,16 @@ struct LLVMState {
   /// co-execution hazard patch to build trampolines without string
   /// round-trips.
   llvm::MCInst VNopInst;
+
+  /// MC opcodes for the kernel-entry stub sequence, resolved once at
+  /// initLLVM() time through the asm parser. The idempotency matcher compares
+  /// decoded opcodes against these cached values instead of matching mnemonic
+  /// strings or tablegen enum names.
+  unsigned GlobalWbOpcode = 0;
+  unsigned SGetPcI64Opcode = 0;
+  unsigned SAddU32Opcode = 0;
+  unsigned SAddcU32Opcode = 0;
+  unsigned SSetPcI64Opcode = 0;
 
   bool Valid = false;
 
@@ -630,19 +663,37 @@ HotswapPatchVTable &getHotswapPatchVTable();
 #include "comgr-hotswap-patches.def"
 #undef HOTSWAP_PATCH
 
-// -- Function declarations (B0-to-A0 policy layer) ----------------------------
+// -- Function declarations (GFX1250 hotswap policy layer) ---------------------
 
-/// Run the full GFX1250 B0-to-A0 rewrite pipeline on \p ElfData / \p ElfSize.
+struct Gfx1250RewriteOptions {
+  bool RunB0A0Patches = true;
+  bool RunEntryTrampolines = false;
+};
+
+/// Build a 256-byte, entry-aligned HotSwap kernel-entry stub at
+/// \p StubVAddr that jumps to \p EntryVAddr using PC-relative address
+/// materialization. Returns an empty vector if MC assembly fails.
+llvm::SmallVector<uint8_t> buildKernelEntryTrampoline(uint64_t StubVAddr,
+                                                      uint64_t EntryVAddr,
+                                                      const LLVMState &LS);
+
+/// Structural matcher for the entry stubs produced by
+/// buildKernelEntryTrampoline, used to keep the rewrite idempotent.
+bool isKernelEntryTrampoline(llvm::ArrayRef<uint8_t> Bytes,
+                             const LLVMState &LS);
+
+/// Run the selected GFX1250 hotswap rewrite passes on \p ElfData / \p ElfSize.
 /// \p TargetIdent is the parsed target ISA (produced upstream by Comgr's
-/// parseTargetIdentifier()); it is threaded into the MC init so the subtarget
-/// triple and feature flags are preserved rather than being reconstructed
-/// from just the processor name. On success \p Out is populated with an owned
-/// buffer containing the rewritten code object. The caller can transfer the
-/// buffer directly to a comgr DataObject via
-/// DataObject::setData(std::unique_ptr<MemoryBuffer>).
+/// parseTargetIdentifier() or the hotswap-local stepping parser); it is
+/// threaded into the MC init so the subtarget triple and feature flags are
+/// preserved rather than being reconstructed from just the processor name. On
+/// success \p Out is populated with an owned buffer containing the rewritten
+/// code object. The caller can transfer the buffer directly to a comgr
+/// DataObject via DataObject::setData(std::unique_ptr<MemoryBuffer>).
 amd_comgr_status_t
 retargetCodeObjectB0A0(const void *ElfData, size_t ElfSize,
                        const TargetIdentifier &TargetIdent,
+                       const Gfx1250RewriteOptions &Options,
                        std::unique_ptr<llvm::MemoryBuffer> &Out);
 
 } // namespace hotswap
