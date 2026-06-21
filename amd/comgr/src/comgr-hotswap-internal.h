@@ -663,11 +663,11 @@ HotswapPatchVTable &getHotswapPatchVTable();
 #include "comgr-hotswap-patches.def"
 #undef HOTSWAP_PATCH
 
-// -- Function declarations (GFX1250 hotswap policy layer) ---------------------
+// -- Function declarations (kernel-entry trampoline pass) ---------------------
 
-struct Gfx1250RewriteOptions {
-  bool RunB0A0Patches = true;
-  bool RunEntryTrampolines = false;
+struct KernelEntryTrampolineFixup {
+  std::string KernelName;
+  uint64_t StubTextOffset = 0;
 };
 
 /// Build a 256-byte, entry-aligned HotSwap kernel-entry stub at
@@ -681,6 +681,26 @@ llvm::SmallVector<uint8_t> buildKernelEntryTrampoline(uint64_t StubVAddr,
 /// buildKernelEntryTrampoline, used to keep the rewrite idempotent.
 bool isKernelEntryTrampoline(llvm::ArrayRef<uint8_t> Bytes,
                              const LLVMState &LS);
+
+/// Append one entry stub per kernel descriptor that does not already target a
+/// HotSwap entry stub. The stubs are appended to \p Growth and descriptor
+/// rewrites are recorded in \p OutFixups for application after ELF growth.
+std::optional<uint32_t> appendKernelEntryTrampolines(
+    const ElfView &Elf, const LLVMState &LS, std::vector<Trampoline> &Growth,
+    std::vector<KernelEntryTrampolineFixup> &OutFixups);
+
+/// Apply descriptor entry-offset rewrites recorded by
+/// appendKernelEntryTrampolines after the ELF has been grown.
+bool rewriteKernelEntryDescriptorOffsets(
+    llvm::WritableMemoryBuffer &OutBuf, uint64_t OldTextSize,
+    llvm::ArrayRef<KernelEntryTrampolineFixup> Fixups);
+
+// -- Function declarations (GFX1250 hotswap policy layer) ---------------------
+
+struct Gfx1250RewriteOptions {
+  bool RunB0A0Patches = true;
+  bool RunEntryTrampolines = false;
+};
 
 /// Run the selected GFX1250 hotswap rewrite passes on \p ElfData / \p ElfSize.
 /// \p TargetIdent is the parsed target ISA (produced upstream by Comgr's
