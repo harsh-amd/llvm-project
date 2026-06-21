@@ -5,8 +5,20 @@
 
 // RUN: hotswap-rewrite %t.elf \
 // RUN:   amdgcn-amd-amdhsa--gfx1250 amdgcn-amd-amdhsa--gfx1250 \
+// RUN:   --output %t.default.elf \
 // RUN:   | %FileCheck --check-prefix=DEFAULT %s
 // DEFAULT: RESULT: SUCCESS
+// RUN: cmp %t.elf %t.default.elf
+
+// RUN: AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES=0 hotswap-rewrite %t.elf \
+// RUN:   amdgcn-amd-amdhsa--gfx1250 amdgcn-amd-amdhsa--gfx1250 \
+// RUN:   --output %t.disabled.elf \
+// RUN:   | %FileCheck --check-prefix=DEFAULT %s
+// RUN: cmp %t.elf %t.disabled.elf
+// RUN: %llvm-objdump -d %t.disabled.elf | %FileCheck --check-prefix=NO-TRAMP %s
+// NO-TRAMP-LABEL: <entry_tramp_kernel>:
+// NO-TRAMP: s_endpgm
+// NO-TRAMP-NOT: global_wb
 
 // RUN: AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES=1 hotswap-rewrite %t.elf \
 // RUN:   amdgcn-amd-amdhsa--gfx1250 amdgcn-amd-amdhsa--gfx1250 \
