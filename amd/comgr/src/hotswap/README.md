@@ -5,28 +5,35 @@ gfx1250 stepping runs correctly on another. The `amd_comgr_hotswap_rewrite` API
 applies a small set of stepping-specific patches in place, without recompiling
 the code object.
 
-This directory ships two things:
+This directory ships two COMGR-side pieces:
 
-- The comgr hotswap tool (`libamd_comgr_hotswap_tool.so`), loaded via the
-  `HSA_TOOLS_LIB` env var, which applies the rewrite automatically at runtime.
+- The `amd_comgr_hotswap_rewrite` API, which applies stepping-specific patches
+  and optional entry trampolines to a single code object.
 - The transpiler, a raiser-based path for the heavier cross-ISA case. It is
   documented at the bottom of this file.
 
-The tool is Linux only: it requires the HSA runtime, so the build errors on
-other platforms.
+COMGR does not ship an `HSA_TOOLS_LIB` runtime tool. Runtime interception is
+owned by rocm-systems' `libhsa-hotswap.so`, which loads code objects through HSA
+and calls `amd_comgr_hotswap_rewrite` when its policy allows a rewrite.
 
-## Running with the tool
+## Running at runtime
 
-Point `HSA_TOOLS_LIB` at the tool and run any HIP or HSA application unchanged:
+Build and install the hotswap tool from rocm-systems, then point
+`HSA_TOOLS_LIB` at that library and run any HIP or HSA application unchanged:
 
 ```bash
-HSA_TOOLS_LIB=/opt/rocm/lib/libamd_comgr_hotswap_tool.so ./my_app
+HSA_TOOLS_LIB=/opt/rocm/lib/libhsa-hotswap.so ./my_app
 ```
 
-`HSA_TOOLS_LIB` tells the `libhsa-runtime` what tool to hand each code object it encounters to before dispatch. When the tool detects a gfx1250 A0 board, it rewrites every gfx1250 code object in place via `amd_comgr_hotswap_rewrite`. Everything else passes through untouched.
+`HSA_TOOLS_LIB` tells `libhsa-runtime` what tool to hand each code object to
+before dispatch. The rocm-systems tool rewrites gfx1250 A0 loads for the
+B0-to-A0 stepping patches. If `AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES=1` is set,
+the tool also asks COMGR to redirect gfx1250 kernel descriptor entries through
+entry stubs, independent of the detected A0/B0 revision. Everything else passes
+through unchanged.
 
-If a rewrite fails, the tool logs the failure and forwards the original code
-object. The application still runs, just without the rewrite applied.
+If a rewrite fails, the runtime tool logs the failure and forwards the original
+code object. The application still runs, just without the rewrite applied.
 
 ## Supported architectures
 
@@ -39,40 +46,13 @@ object. The application still runs, just without the rewrite applied.
 HotSwap currently requires a homogeneous GPU setup. Running it across multiple
 GPUs is not supported.
 
-The tool detects the device on its own. It reads the agent ISA name and
-`HSA_AMD_AGENT_INFO_ASIC_REVISION`, then arms the rewrite only when the target
-is gfx1250, the revision is 0 (A0), and the revision query succeeded. A failed
-query is never treated as A0. On any other device or revision, code objects pass
-through unchanged. No environment variable is needed to turn this on.
-
-To confirm the rewrite is active, set `HSA_HOTSWAP_TOOL_VERBOSE=1` and look for
-this line in the logs:
-
-```bash
-hotswap_tool: device=gfx1250 asic_revision=0 -> A0 (rewrite armed)
-```
-
 ## Environment variables
 
 | Variable                   | Effect                                                        |
 | -------------------------- | ------------------------------------------------------------- |
-| `HSA_TOOLS_LIB`            | Standard HSA hook. Set it to this `.so` to load the tool.     |
-| `HSA_HOTSWAP_TOOL_VERBOSE` | Set to `1` for diagnostic logging to stderr, covering device detection and per-code-object rewrite results. Logging only; does not change behavior. Off by default. |
-
-## Building the tool
-
-The tool is off by default, since most comgr consumers do not need it. Enable it
-and point the build at the HSA headers:
-
-```bash
-cmake -S amd/comgr -B build \
-  -DHOTSWAP_BUILD_TOOL=ON \
-  -DHOTSWAP_TOOL_HSA_INCLUDE_ROOT=/path/to/rocr-runtime/runtime/hsa-runtime
-ninja -C build amd_comgr_hotswap_tool
-```
-
-If `HOTSWAP_BUILD_TOOL` is on but `inc/hsa.h` cannot be found under
-`HOTSWAP_TOOL_HSA_INCLUDE_ROOT`, the build fails.
+| `HSA_TOOLS_LIB`                         | Standard HSA hook. Set it to rocm-systems' `libhsa-hotswap.so` to load the runtime tool. |
+| `AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES`   | Set to `1` to redirect gfx1250 kernel descriptor entries through COMGR-generated entry stubs, independent of A0/B0 stepping. Off by default. |
+| `HSA_HOTSWAP_TOOL_VERBOSE`              | rocm-systems runtime-tool diagnostic logging, when supported by that tool. |
 
 ## Transpiler (cross-gen)
 

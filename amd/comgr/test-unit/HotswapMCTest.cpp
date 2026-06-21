@@ -295,6 +295,42 @@ TEST(BuildTrampoline, EmptyOnBadAsm) {
   EXPECT_TRUE(T.Bytes.empty());
 }
 
+// -- buildKernelEntryTrampoline -----------------------------------------------
+
+TEST(BuildKernelEntryTrampoline, BuildsRecognizedPcRelativeStub) {
+  LLVMState S = initLLVM(makeGfx1250Ident());
+  ASSERT_TRUE(S.Valid);
+
+  constexpr uint64_t StubVAddr = 0x200000;
+  constexpr uint64_t EntryVAddr = 0x10100;
+  llvm::SmallVector<uint8_t> Bytes =
+      buildKernelEntryTrampoline(StubVAddr, EntryVAddr, S);
+
+  ASSERT_EQ(Bytes.size(), KernelEntryStubStride);
+  EXPECT_TRUE(isKernelEntryTrampoline(Bytes, S));
+
+  std::vector<InternalDecodedInst> Decoded;
+  ASSERT_TRUE(decodeTextSection(Bytes.data(), Bytes.size(), S, Decoded));
+  ASSERT_GE(Decoded.size(), 6u);
+  EXPECT_EQ(Decoded[0].Inst.getOpcode(), S.GlobalWbOpcode);
+  EXPECT_EQ(Decoded[1].Inst.getOpcode(), S.VNopInst.getOpcode());
+  EXPECT_EQ(Decoded[2].Inst.getOpcode(), S.SGetPcI64Opcode);
+  EXPECT_EQ(Decoded[3].Inst.getOpcode(), S.SAddU32Opcode);
+  EXPECT_EQ(Decoded[4].Inst.getOpcode(), S.SAddcU32Opcode);
+  EXPECT_EQ(Decoded[5].Inst.getOpcode(), S.SSetPcI64Opcode);
+}
+
+TEST(BuildKernelEntryTrampoline, MatcherRejectsNonStubBytes) {
+  LLVMState S = initLLVM(makeGfx1250Ident());
+  ASSERT_TRUE(S.Valid);
+
+  std::vector<uint8_t> Bytes(KernelEntryStubStride, 0);
+  for (size_t I = 0; I < Bytes.size(); I += MinInstSize)
+    std::memcpy(Bytes.data() + I, S.SNopBytes.data(), MinInstSize);
+
+  EXPECT_FALSE(isKernelEntryTrampoline(Bytes, S));
+}
+
 // -- classifyWmmaNops ---------------------------------------------------------
 
 TEST(ClassifyWmmaNops, NonWmmaReturnsDefault) {
