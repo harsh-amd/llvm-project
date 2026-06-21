@@ -577,99 +577,77 @@ static void adjustProgramHeaders(uint8_t *Elf, size_t ElfSize,
   }
 }
 
-static uint8_t *sectionHeaderAt(uint8_t *Elf, size_t ElfSize, uint64_t Shoff,
-                                uint16_t Shentsize, uint16_t Index) {
-  uint64_t Pos = Shoff + static_cast<uint64_t>(Index) * Shentsize;
-  if (Pos + sizeof(Shdr) > ElfSize)
-    return nullptr;
-  return Elf + Pos;
-}
-
 static void adjustSymbolValues(uint8_t *Elf, size_t ElfSize,
                                uint64_t TextOffset, size_t TrampTotal) {
   if (TrampTotal == 0)
     return;
-  if (ElfSize < sizeof(Ehdr)) {
-    log() << "hotswap: error: adjustSymbolValues: ELF size " << ElfSize
-          << " is smaller than ELF64 header size " << sizeof(Ehdr) << ".\n";
+
+  Expected<ELFFileT> FileOrErr =
+      ELFFileT::create(StringRef(reinterpret_cast<const char *>(Elf), ElfSize));
+  if (!FileOrErr) {
+    log() << "hotswap: error: adjustSymbolValues: failed to parse grown ELF: "
+          << toString(FileOrErr.takeError()) << "\n";
     return;
   }
+  ELFFileT File = std::move(*FileOrErr);
 
-  uint16_t EType;
-  uint64_t Shoff;
-  uint16_t Shentsize;
-  uint16_t Shnum;
-  std::memcpy(&EType, Elf + offsetof(Ehdr, e_type), sizeof(EType));
-  std::memcpy(&Shoff, Elf + offsetof(Ehdr, e_shoff), sizeof(Shoff));
-  std::memcpy(&Shentsize, Elf + offsetof(Ehdr, e_shentsize), sizeof(Shentsize));
-  std::memcpy(&Shnum, Elf + offsetof(Ehdr, e_shnum), sizeof(Shnum));
-  if (EType == ELF::ET_REL)
+  if (File.getHeader().e_type == ELF::ET_REL)
     return;
-  if (Shentsize < sizeof(Shdr)) {
-    log() << "hotswap: error: adjustSymbolValues: section header entry size "
-          << Shentsize << " is smaller than ELF64 section header size "
-          << sizeof(Shdr) << ".\n";
+
+  Expected<ELFT::ShdrRange> SectionsOrErr = File.sections();
+  if (!SectionsOrErr) {
+    log() << "hotswap: error: adjustSymbolValues: failed to read section "
+          << "headers: " << toString(SectionsOrErr.takeError()) << "\n";
     return;
   }
+  ELFT::ShdrRange Sections = *SectionsOrErr;
 
-  for (uint16_t I = 0; I < Shnum; ++I) {
-    uint8_t *SymSh = sectionHeaderAt(Elf, ElfSize, Shoff, Shentsize, I);
-    if (!SymSh) {
-      log() << "hotswap: error: adjustSymbolValues: section header " << I
-            << " is outside the ELF buffer.\n";
-      break;
-    }
-
-    uint32_t ShType;
-    uint64_t ShOffset;
-    uint64_t ShSize;
-    uint64_t ShEntSize;
-    std::memcpy(&ShType, SymSh + offsetof(Shdr, sh_type), sizeof(ShType));
-    if (ShType != ELF::SHT_SYMTAB && ShType != ELF::SHT_DYNSYM)
-      continue;
-    std::memcpy(&ShOffset, SymSh + offsetof(Shdr, sh_offset), sizeof(ShOffset));
-    std::memcpy(&ShSize, SymSh + offsetof(Shdr, sh_size), sizeof(ShSize));
-    std::memcpy(&ShEntSize, SymSh + offsetof(Shdr, sh_entsize),
-                sizeof(ShEntSize));
-    if (ShEntSize < sizeof(ELF::Elf64_Sym) || ShOffset > ElfSize ||
-        ShSize > ElfSize - ShOffset) {
-      log() << "hotswap: error: adjustSymbolValues: symbol table section " << I
-            << " has invalid offset/size/entry size.\n";
+  unsigned SectionIndex = 0;
+  for (const ELFT::Shdr &SymShdr : Sections) {
+    if (SymShdr.sh_type != ELF::SHT_SYMTAB &&
+        SymShdr.sh_type != ELF::SHT_DYNSYM) {
+      ++SectionIndex;
       continue;
     }
 
-    for (uint64_t Off = ShOffset;
-         Off + sizeof(ELF::Elf64_Sym) <= ShOffset + ShSize; Off += ShEntSize) {
-      uint8_t *Sym = Elf + Off;
-      uint16_t Shndx;
-      std::memcpy(&Shndx, Sym + offsetof(ELF::Elf64_Sym, st_shndx),
-                  sizeof(Shndx));
-      if (Shndx == ELF::SHN_UNDEF || Shndx >= ELF::SHN_LORESERVE)
+    Expected<ELFT::SymRange> SymsOrErr = File.symbols(&SymShdr);
+    if (!SymsOrErr) {
+      log() << "hotswap: error: adjustSymbolValues: failed to read symbol "
+            << "table section " << SectionIndex << ": "
+            << toString(SymsOrErr.takeError()) << "\n";
+      ++SectionIndex;
+      continue;
+    }
+
+    for (const ELFT::Sym &Sym : *SymsOrErr) {
+      if (Sym.st_shndx == ELF::SHN_UNDEF || Sym.st_shndx >= ELF::SHN_LORESERVE)
         continue;
-      uint8_t *DefSh = sectionHeaderAt(Elf, ElfSize, Shoff, Shentsize, Shndx);
-      if (!DefSh) {
-        log() << "hotswap: error: adjustSymbolValues: symbol at file offset 0x"
-              << utohexstr(Off) << " references missing section " << Shndx
-              << ".\n";
+
+      Expected<const ELFT::Shdr *> DefShdrOrErr = File.getSection(Sym.st_shndx);
+      if (!DefShdrOrErr) {
+        log() << "hotswap: error: adjustSymbolValues: symbol references "
+              << "missing section " << Sym.st_shndx << ": "
+              << toString(DefShdrOrErr.takeError()) << "\n";
+        continue;
+      }
+      const ELFT::Shdr &DefShdr = **DefShdrOrErr;
+      if (!(DefShdr.sh_flags & ELF::SHF_ALLOC) ||
+          DefShdr.sh_offset <= TextOffset)
+        continue;
+
+      const uint8_t *SymBytes = reinterpret_cast<const uint8_t *>(&Sym);
+      if (SymBytes < File.base() || SymBytes + sizeof(ELFT::Sym) > File.end()) {
+        log() << "hotswap: error: adjustSymbolValues: symbol table entry is "
+              << "outside the ELF buffer.\n";
         continue;
       }
 
-      uint64_t DefFlags;
-      uint64_t DefOffset;
-      std::memcpy(&DefFlags, DefSh + offsetof(Shdr, sh_flags),
-                  sizeof(DefFlags));
-      std::memcpy(&DefOffset, DefSh + offsetof(Shdr, sh_offset),
-                  sizeof(DefOffset));
-      if (!(DefFlags & ELF::SHF_ALLOC) || DefOffset <= TextOffset)
-        continue;
-
-      uint64_t Value;
-      std::memcpy(&Value, Sym + offsetof(ELF::Elf64_Sym, st_value),
-                  sizeof(Value));
-      Value += TrampTotal;
-      std::memcpy(Sym + offsetof(ELF::Elf64_Sym, st_value), &Value,
+      uint64_t SymOffset = SymBytes - File.base();
+      uint64_t Value = Sym.st_value + TrampTotal;
+      std::memcpy(Elf + SymOffset + offsetof(ELFT::Sym, st_value), &Value,
                   sizeof(Value));
     }
+    ++SectionIndex;
   }
 }
 
