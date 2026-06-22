@@ -15,7 +15,11 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#if __has_include("llvm/TargetParser/AMDGPUTargetParser.h")
 #include "llvm/TargetParser/AMDGPUTargetParser.h"
+#else
+#include "llvm/TargetParser/TargetParser.h"
+#endif
 #include "llvm/TargetParser/Triple.h"
 
 namespace COMGR::hotswap {

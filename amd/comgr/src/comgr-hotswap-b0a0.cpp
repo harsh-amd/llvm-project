@@ -624,7 +624,7 @@ amd_comgr_status_t retargetCodeObjectB0A0(const void *ElfData, size_t ElfSize,
       GrowthTotal += T.Bytes.size();
     patchDebugSections(*Result, Deferred, Elf, GrowthTotal);
     if (!rewriteKernelEntryDescriptorOffsets(*Result, Elf.textSize(),
-                                             EntryFixups))
+                                             EntryFixups, LS.Cpu))
       return AMD_COMGR_STATUS_ERROR;
   } else {
     Result = WritableMemoryBuffer::getNewUninitMemBuffer(ElfSize);

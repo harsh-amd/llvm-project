@@ -310,6 +310,48 @@ bool ElfView::updateKernelDescriptorEntryOffset(StringRef KernelName,
   return true;
 }
 
+bool ElfView::clearKernelDescriptorInstPrefSize(StringRef KernelName,
+                                                StringRef TargetCpu) {
+  namespace hsa = amdhsa;
+  uint8_t *Kd = findKernelDescriptor(KernelName);
+  if (!Kd) {
+    log() << "hotswap: error: clearKernelDescriptorInstPrefSize: kernel "
+          << "descriptor symbol '" << KernelName << ".kd' not found.\n";
+    return false;
+  }
+
+  uint32_t Rsrc3 = 0;
+  std::memcpy(&Rsrc3,
+              Kd + offsetof(hsa::kernel_descriptor_t, compute_pgm_rsrc3),
+              sizeof(Rsrc3));
+
+  uint32_t OldPref = 0;
+  if (TargetCpu.starts_with("gfx12")) {
+    OldPref =
+        AMDHSA_BITS_GET(Rsrc3,
+                        hsa::COMPUTE_PGM_RSRC3_GFX12_PLUS_INST_PREF_SIZE);
+    Rsrc3 &= ~hsa::COMPUTE_PGM_RSRC3_GFX12_PLUS_INST_PREF_SIZE;
+  } else if (TargetCpu.starts_with("gfx11")) {
+    OldPref =
+        AMDHSA_BITS_GET(Rsrc3, hsa::COMPUTE_PGM_RSRC3_GFX11_INST_PREF_SIZE);
+    Rsrc3 &= ~hsa::COMPUTE_PGM_RSRC3_GFX11_INST_PREF_SIZE;
+  } else {
+    log() << "hotswap: error: clearKernelDescriptorInstPrefSize: unsupported "
+          << "target CPU '" << TargetCpu << "' for kernel '" << KernelName
+          << "'.\n";
+    return false;
+  }
+
+  std::memcpy(Kd + offsetof(hsa::kernel_descriptor_t, compute_pgm_rsrc3),
+              &Rsrc3, sizeof(Rsrc3));
+
+  if (OldPref != 0)
+    log() << "hotswap: cleared COMPUTE_PGM_RSRC3.INST_PREF_SIZE for appended "
+          << "entry trampoline in kernel '" << KernelName << "' (was "
+          << OldPref << ")\n";
+  return true;
+}
+
 // -- ElfView::getKernelVgprCount ----------------------------------------------
 
 std::optional<unsigned>

@@ -212,6 +212,11 @@ public:
   bool updateKernelDescriptorEntryOffset(llvm::StringRef KernelName,
                                          int64_t NewEntryOffset);
 
+  /// Clear COMPUTE_PGM_RSRC3.INST_PREF_SIZE for \p KernelName when a rewrite
+  /// redirects the kernel entry to appended, non-compiler-laid-out code.
+  bool clearKernelDescriptorInstPrefSize(llvm::StringRef KernelName,
+                                         llvm::StringRef TargetCpu);
+
   /// Read the VGPR count from the kernel descriptor for \p KernelName.
   /// Returns std::nullopt if the descriptor is not found.
   std::optional<unsigned> getKernelVgprCount(llvm::StringRef KernelName,
@@ -693,7 +698,8 @@ std::optional<uint32_t> appendKernelEntryTrampolines(
 /// appendKernelEntryTrampolines after the ELF has been grown.
 bool rewriteKernelEntryDescriptorOffsets(
     llvm::WritableMemoryBuffer &OutBuf, uint64_t OldTextSize,
-    llvm::ArrayRef<KernelEntryTrampolineFixup> Fixups);
+    llvm::ArrayRef<KernelEntryTrampolineFixup> Fixups,
+    llvm::StringRef TargetCpu);
 
 // -- Function declarations (GFX1250 hotswap policy layer) ---------------------
 

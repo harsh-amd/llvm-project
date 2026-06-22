@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "comgr-hotswap-internal.h"
+#include "comgr-test-elf-utils.h"
 #include "comgr.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/TargetSelect.h"
@@ -71,6 +72,119 @@ static uint32_t readDword(const uint8_t *Bytes) {
   uint32_t V;
   std::memcpy(&V, Bytes, sizeof(V));
   return V;
+}
+
+static uint64_t alignTo8(uint64_t V) { return (V + 7) & ~uint64_t{7}; }
+
+static std::vector<uint8_t> makeKernelEntryTestElf(llvm::ArrayRef<uint8_t> Text) {
+  using namespace llvm::ELF;
+  namespace hsa = llvm::amdhsa;
+
+  static constexpr uint64_t ShOff = sizeof(Elf64_Ehdr);
+  static constexpr uint64_t TextOff = 0x240;
+  static constexpr uint64_t TextAddr = 0x1000;
+  static constexpr uint64_t RodataAddr = 0x2000;
+  static constexpr uint64_t KdBytes = sizeof(hsa::kernel_descriptor_t);
+
+  const char StrTab[] = "\0kernel\0kernel.kd\0";
+  const char ShStrTab[] = "\0.text\0.rodata\0.strtab\0.symtab\0.shstrtab\0";
+
+  const uint64_t RodataOff = alignTo8(TextOff + Text.size());
+  const uint64_t StrTabOff = alignTo8(RodataOff + KdBytes);
+  const uint64_t SymTabOff = alignTo8(StrTabOff + sizeof(StrTab));
+  const uint64_t ShStrTabOff =
+      alignTo8(SymTabOff + 3 * sizeof(Elf64_Sym));
+  const uint64_t BufSize = alignTo8(ShStrTabOff + sizeof(ShStrTab) + 64);
+
+  std::vector<uint8_t> Buf(BufSize, 0);
+  std::memcpy(Buf.data() + ShStrTabOff, ShStrTab, sizeof(ShStrTab));
+  std::memcpy(Buf.data() + StrTabOff, StrTab, sizeof(StrTab));
+  std::memcpy(Buf.data() + TextOff, Text.data(), Text.size());
+
+  Elf64_Ehdr Ehdr = comgr_test::makeElf64Ehdr(EM_AMDGPU);
+  Ehdr.e_ident[EI_OSABI] = ELFOSABI_AMDGPU_HSA;
+  Ehdr.e_type = ET_DYN;
+  Ehdr.e_version = EV_CURRENT;
+  Ehdr.e_shoff = ShOff;
+  Ehdr.e_ehsize = sizeof(Elf64_Ehdr);
+  Ehdr.e_shentsize = sizeof(Elf64_Shdr);
+  Ehdr.e_shnum = 6;
+  Ehdr.e_shstrndx = 5;
+  std::memcpy(Buf.data(), &Ehdr, sizeof(Ehdr));
+
+  Elf64_Shdr TextSh{};
+  TextSh.sh_name = 1;
+  TextSh.sh_type = SHT_PROGBITS;
+  TextSh.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+  TextSh.sh_offset = TextOff;
+  TextSh.sh_addr = TextAddr;
+  TextSh.sh_size = Text.size();
+  TextSh.sh_addralign = 4;
+  std::memcpy(Buf.data() + ShOff + 1 * sizeof(Elf64_Shdr), &TextSh,
+              sizeof(TextSh));
+
+  Elf64_Shdr RodataSh{};
+  RodataSh.sh_name = 7;
+  RodataSh.sh_type = SHT_PROGBITS;
+  RodataSh.sh_flags = SHF_ALLOC;
+  RodataSh.sh_offset = RodataOff;
+  RodataSh.sh_addr = RodataAddr;
+  RodataSh.sh_size = KdBytes;
+  RodataSh.sh_addralign = 8;
+  std::memcpy(Buf.data() + ShOff + 2 * sizeof(Elf64_Shdr), &RodataSh,
+              sizeof(RodataSh));
+
+  Elf64_Shdr StrtabSh{};
+  StrtabSh.sh_name = 15;
+  StrtabSh.sh_type = SHT_STRTAB;
+  StrtabSh.sh_offset = StrTabOff;
+  StrtabSh.sh_size = sizeof(StrTab);
+  std::memcpy(Buf.data() + ShOff + 3 * sizeof(Elf64_Shdr), &StrtabSh,
+              sizeof(StrtabSh));
+
+  Elf64_Shdr SymtabSh{};
+  SymtabSh.sh_name = 23;
+  SymtabSh.sh_type = SHT_SYMTAB;
+  SymtabSh.sh_offset = SymTabOff;
+  SymtabSh.sh_size = 3 * sizeof(Elf64_Sym);
+  SymtabSh.sh_link = 3;
+  SymtabSh.sh_entsize = sizeof(Elf64_Sym);
+  std::memcpy(Buf.data() + ShOff + 4 * sizeof(Elf64_Shdr), &SymtabSh,
+              sizeof(SymtabSh));
+
+  Elf64_Shdr ShstrSh{};
+  ShstrSh.sh_name = 31;
+  ShstrSh.sh_type = SHT_STRTAB;
+  ShstrSh.sh_offset = ShStrTabOff;
+  ShstrSh.sh_size = sizeof(ShStrTab);
+  std::memcpy(Buf.data() + ShOff + 5 * sizeof(Elf64_Shdr), &ShstrSh,
+              sizeof(ShstrSh));
+
+  int64_t EntryOffset = static_cast<int64_t>(TextAddr - RodataAddr);
+  std::memcpy(Buf.data() + RodataOff +
+                  offsetof(hsa::kernel_descriptor_t,
+                           kernel_code_entry_byte_offset),
+              &EntryOffset, sizeof(EntryOffset));
+
+  Elf64_Sym KernelSym{};
+  KernelSym.st_name = 1;
+  KernelSym.setBindingAndType(STB_GLOBAL, STT_FUNC);
+  KernelSym.st_shndx = 1;
+  KernelSym.st_value = TextAddr;
+  KernelSym.st_size = Text.size();
+  std::memcpy(Buf.data() + SymTabOff + 1 * sizeof(Elf64_Sym), &KernelSym,
+              sizeof(KernelSym));
+
+  Elf64_Sym KdSym{};
+  KdSym.st_name = 8;
+  KdSym.setBindingAndType(STB_GLOBAL, STT_OBJECT);
+  KdSym.st_shndx = 2;
+  KdSym.st_value = RodataAddr;
+  KdSym.st_size = KdBytes;
+  std::memcpy(Buf.data() + SymTabOff + 2 * sizeof(Elf64_Sym), &KdSym,
+              sizeof(KdSym));
+
+  return Buf;
 }
 
 // -- initLLVM ----------------------------------------------------------------
@@ -303,6 +417,9 @@ TEST(BuildKernelEntryTrampoline, BuildsRecognizedPcRelativeStub) {
 
   constexpr uint64_t StubVAddr = 0x200000;
   constexpr uint64_t EntryVAddr = 0x10100;
+  llvm::SmallVector<uint8_t> GlobalWb = assembleSingleInst("global_wb", S);
+  ASSERT_EQ(GlobalWb.size(), 3 * MinInstSize);
+
   llvm::SmallVector<uint8_t> Bytes =
       buildKernelEntryTrampoline(StubVAddr, EntryVAddr, S);
 
@@ -329,6 +446,69 @@ TEST(BuildKernelEntryTrampoline, MatcherRejectsNonStubBytes) {
     std::memcpy(Bytes.data() + I, S.SNopBytes.data(), MinInstSize);
 
   EXPECT_FALSE(isKernelEntryTrampoline(Bytes, S));
+}
+
+TEST(KernelEntryTrampoline, ClearsInstPrefSizeForAppendedStub) {
+  namespace hsa = llvm::amdhsa;
+
+  LLVMState S = initLLVM(makeGfx1250Ident());
+  ASSERT_TRUE(S.Valid);
+
+  llvm::SmallVector<uint8_t> Text = assembleSingleInst("s_endpgm", S);
+  ASSERT_EQ(Text.size(), MinInstSize);
+  std::vector<uint8_t> ElfBytes = makeKernelEntryTestElf(Text);
+  llvm::Expected<ElfView> ViewOrErr =
+      ElfView::create(ElfBytes.data(), ElfBytes.size());
+  ASSERT_TRUE((bool)ViewOrErr) << llvm::toString(ViewOrErr.takeError());
+
+  uint8_t *Kd = ViewOrErr->findKernelDescriptor("kernel");
+  ASSERT_NE(Kd, nullptr);
+  uint32_t Rsrc3 = 0;
+  AMDHSA_BITS_SET(Rsrc3,
+                  hsa::COMPUTE_PGM_RSRC3_GFX12_PLUS_INST_PREF_SIZE, 7);
+  Rsrc3 |= hsa::COMPUTE_PGM_RSRC3_GFX12_PLUS_GLG_EN;
+  std::memcpy(Kd + offsetof(hsa::kernel_descriptor_t, compute_pgm_rsrc3),
+              &Rsrc3, sizeof(Rsrc3));
+
+  const uint64_t StubVAddr = ViewOrErr->textAddr() + ViewOrErr->textSize();
+  llvm::SmallVector<uint8_t> Stub =
+      buildKernelEntryTrampoline(StubVAddr, ViewOrErr->textAddr(), S);
+  ASSERT_EQ(Stub.size(), KernelEntryStubStride);
+
+  Trampoline T;
+  T.Bytes.assign(Stub.begin(), Stub.end());
+  std::unique_ptr<llvm::WritableMemoryBuffer> Out =
+      ViewOrErr->growWithTrampolines({T}, S.SNopBytes);
+  ASSERT_NE(Out, nullptr);
+
+  KernelEntryTrampolineFixup Fixup{"kernel", 0};
+  ASSERT_TRUE(rewriteKernelEntryDescriptorOffsets(*Out, ViewOrErr->textSize(),
+                                                  {Fixup}, S.Cpu));
+
+  uint8_t *OutData = reinterpret_cast<uint8_t *>(Out->getBufferStart());
+  llvm::Expected<ElfView> OutView =
+      ElfView::create(OutData, Out->getBufferSize());
+  ASSERT_TRUE((bool)OutView) << llvm::toString(OutView.takeError());
+
+  uint8_t *OutKd = OutView->findKernelDescriptor("kernel");
+  ASSERT_NE(OutKd, nullptr);
+  uint32_t OutRsrc3 = 0;
+  std::memcpy(&OutRsrc3,
+              OutKd + offsetof(hsa::kernel_descriptor_t, compute_pgm_rsrc3),
+              sizeof(OutRsrc3));
+  EXPECT_EQ(AMDHSA_BITS_GET(
+                OutRsrc3,
+                hsa::COMPUTE_PGM_RSRC3_GFX12_PLUS_INST_PREF_SIZE),
+            0u);
+  EXPECT_NE(OutRsrc3 & hsa::COMPUTE_PGM_RSRC3_GFX12_PLUS_GLG_EN, 0u);
+
+  std::vector<KernelDescriptorInfo> KDs = OutView->kernelDescriptors();
+  ASSERT_EQ(KDs.size(), 1u);
+  std::optional<uint64_t> KdVAddr =
+      OutView->getKernelDescriptorVAddr("kernel");
+  ASSERT_TRUE(KdVAddr.has_value());
+  EXPECT_EQ(KDs[0].EntryOffset,
+            static_cast<int64_t>(StubVAddr - *KdVAddr));
 }
 
 // -- classifyWmmaNops ---------------------------------------------------------

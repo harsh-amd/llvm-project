@@ -226,7 +226,7 @@ std::optional<uint32_t> appendKernelEntryTrampolines(
 
 bool rewriteKernelEntryDescriptorOffsets(
     WritableMemoryBuffer &OutBuf, uint64_t OldTextSize,
-    ArrayRef<KernelEntryTrampolineFixup> Fixups) {
+    ArrayRef<KernelEntryTrampolineFixup> Fixups, StringRef TargetCpu) {
   if (Fixups.empty())
     return true;
 
@@ -253,6 +253,8 @@ bool rewriteKernelEntryDescriptorOffsets(
         OutElf.textAddr() + OldTextSize + Fixup.StubTextOffset;
     const int64_t NewOffset = static_cast<int64_t>(StubVAddr - *KdVAddr);
     Ok &= OutElf.updateKernelDescriptorEntryOffset(Fixup.KernelName, NewOffset);
+    Ok &= OutElf.clearKernelDescriptorInstPrefSize(Fixup.KernelName,
+                                                   TargetCpu);
   }
   return Ok;
 }
