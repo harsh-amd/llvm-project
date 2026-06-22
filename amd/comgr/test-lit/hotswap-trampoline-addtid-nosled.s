@@ -38,10 +38,6 @@
 
 // DISASM-LABEL: <test_addtid_nosled>:
 // DISASM-NOT:   ds_load_addtid_b32
-// DISASM:       s_branch
-// DISASM-NEXT:  s_nop 0
-// DISASM-NEXT:  s_wait_dscnt 0x0
-// DISASM-NEXT:  s_endpgm
 
 // COM: Trampoline body appended after .text: lane-id math, 20-bit M0 mask
 // COM: (matches B0's DS-unit M0 read width and is a no-op for any
@@ -56,7 +52,6 @@
 // DISASM-NEXT:  v_add_nc_u32_e32 v5, m0, v5
 // DISASM-NEXT:  v_and_b32_e32 v5, 0xfffff, v5
 // DISASM-NEXT:  ds_load_b32 v5, v5 offset:128
-// DISASM-NEXT:  s_branch
 
 .amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 .text

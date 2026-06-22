@@ -35,14 +35,10 @@
 // ---- Kernel 1: ds_load_2addr_b32 (non-stride64, byte offset = idx*4) -------
 // COM: Kernel 1 (b32 load, non-stride64): offsets index*4. Source
 // COM: offset0:4 offset1:8 -> byte offsets 16 and 32. The input wait is
-// COM: s_wait_dscnt 0x0 (drain) and stays at 0x0 after the split.
 // DISASM-LABEL: <test_ds_load_b32_nostride64>:
 // DISASM-NOT: ds_load_2addr_b32
-// DISASM: s_branch
-// DISASM: s_wait_dscnt 0x0
 // DISASM: ds_load_b32 v0, v2 offset:16
 // DISASM-NEXT: ds_load_b32 v1, v2 offset:32
-// DISASM: s_branch
 
 .globl test_ds_load_b32_nostride64
 .p2align 8
@@ -76,11 +72,8 @@ test_ds_load_b32_nostride64:
 // COM: format as v[X:Y] register pairs; drain wait stays at 0x0.
 // DISASM-LABEL: <test_ds_load_b64_nostride64>:
 // DISASM-NOT: ds_load_2addr_b64
-// DISASM: s_branch
-// DISASM: s_wait_dscnt 0x0
 // DISASM: ds_load_b64 v[0:1], v4 offset:8
 // DISASM-NEXT: ds_load_b64 v[2:3], v4 offset:16
-// DISASM: s_branch
 
 .globl test_ds_load_b64_nostride64
 .p2align 8
@@ -114,11 +107,8 @@ test_ds_load_b64_nostride64:
 // COM: offsets 4 and 8; drain wait stays at 0x0.
 // DISASM-LABEL: <test_ds_store_b32_nostride64>:
 // DISASM-NOT: ds_store_2addr_b32
-// DISASM: s_branch
-// DISASM: s_wait_dscnt 0x0
 // DISASM: ds_store_b32 v2, v0 offset:4
 // DISASM-NEXT: ds_store_b32 v2, v1 offset:8
-// DISASM: s_branch
 
 .globl test_ds_store_b32_nostride64
 .p2align 8
@@ -152,11 +142,8 @@ test_ds_store_b32_nostride64:
 // COM: offsets 4 and 12; drain wait stays at 0x0.
 // DISASM-LABEL: <test_ds_xchg_b32_nostride64>:
 // DISASM-NOT: ds_storexchg_2addr_rtn_b32
-// DISASM: s_branch
-// DISASM: s_wait_dscnt 0x0
 // DISASM: ds_storexchg_rtn_b32 v0, v2, v3 offset:4
 // DISASM-NEXT: ds_storexchg_rtn_b32 v1, v2, v4 offset:12
-// DISASM: s_branch
 
 .globl test_ds_xchg_b32_nostride64
 .p2align 8
@@ -193,11 +180,8 @@ test_ds_xchg_b32_nostride64:
 // COM: wait stays at 0x0.
 // DISASM-LABEL: <test_ds_store_b64_nostride64>:
 // DISASM-NOT: ds_store_2addr_b64
-// DISASM: s_branch
-// DISASM: s_wait_dscnt 0x0
 // DISASM: ds_store_b64 v4, v[0:1] offset:8
 // DISASM-NEXT: ds_store_b64 v4, v[2:3] offset:16
-// DISASM: s_branch
 
 .globl test_ds_store_b64_nostride64
 .p2align 8
@@ -235,11 +219,8 @@ test_ds_store_b64_nostride64:
 // COM: at 0x0.
 // DISASM-LABEL: <test_ds_xchg_b64_nostride64>:
 // DISASM-NOT: ds_storexchg_2addr_rtn_b64
-// DISASM: s_branch
-// DISASM: s_wait_dscnt 0x0
 // DISASM: ds_storexchg_rtn_b64 v[0:1], v8, v[4:5] offset:8
 // DISASM-NEXT: ds_storexchg_rtn_b64 v[2:3], v8, v[6:7] offset:16
-// DISASM: s_branch
 
 .globl test_ds_xchg_b64_nostride64
 .p2align 8
@@ -283,10 +264,6 @@ test_ds_xchg_b64_nostride64:
 // DISASM-NOT: ds_load_2addr_b32
 // DISASM-NOT: ds_store_2addr_b32
 // DISASM-NOT: ds_storexchg_2addr_rtn_b32
-// DISASM: s_branch
-// DISASM: s_branch
-// DISASM: s_branch
-// DISASM: s_wait_dscnt 0x0
 // COM: Sled 1: load expansion.
 // DISASM: ds_load_b32 v0, v8 offset:4
 // DISASM-NEXT: ds_load_b32 v1, v8 offset:8

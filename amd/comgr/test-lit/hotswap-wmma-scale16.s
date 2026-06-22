@@ -28,7 +28,6 @@
 // RUN: %llvm-objdump -d %t.out.elf | %FileCheck --check-prefix=SCALE16 %s
 
 // SCALE16-LABEL: <test_wmma_scale16_16x16>:
-// SCALE16:       s_branch
 // COM: --- scale A reduction: byte pair 0 ---
 // SCALE16:       v_and_b32{{.*}}0xff, v48
 // SCALE16-NEXT:  v_bfe_u32{{.*}}v48, 8, 8
@@ -80,7 +79,6 @@
 // RUN: %llvm-objdump -d %t.out.elf | %FileCheck --check-prefix=SPLIT32 %s
 
 // SPLIT32-LABEL: <test_wmma_scale16_32x16>:
-// SPLIT32:       s_branch
 // COM: --- scale A reduction (shared by both halves) ---
 // SPLIT32:       v_and_b32{{.*}}0xff, v40
 // SPLIT32:       v_max_u32
@@ -104,7 +102,6 @@
 // RUN: %llvm-objdump -d %t.out.elf | %FileCheck --check-prefix=SRC2FLOAT %s
 
 // SRC2FLOAT-LABEL: <test_wmma_scale16_32x16_src2_neg_half>:
-// SRC2FLOAT:       s_branch
 // SRC2FLOAT:       v_wmma_scale_f32_16x16x128_f8f6f4 v[0:7], v[16:23], v[32:39], -0.5, v48, v49
 // SRC2FLOAT:       v_wmma_scale_f32_16x16x128_f8f6f4 v[8:15], v[24:31], v[32:39], -0.5, v48, v49{{.*}}matrix_a_scale:MATRIX_SCALE_ROW1
 

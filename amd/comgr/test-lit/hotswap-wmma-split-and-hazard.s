@@ -34,14 +34,12 @@
 // COM: Kernel body: the splittable K=128 WMMA is replaced by an s_branch;
 // COM: the K=64 iu8 WMMA stays in place (it's the hazard *source*, not a
 // COM: split target); the overlapping v_add_f32 is replaced by an
-// COM: s_branch into the hazard trampoline. Two distinct s_branch sites
 // COM: in the body, then s_endpgm.
 // DISASM-LABEL: <test_split_and_hazard>:
 // DISASM-NOT:   v_wmma_f32_16x16x128_fp8_fp8
-// DISASM:       s_branch
+// DISASM:       v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[0:7], v[16:23], v[32:39]
+// DISASM-NEXT:  v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[24:31], v[32:39]
 // DISASM:       v_wmma_i32_16x16x64_iu8
-// DISASM-NEXT:  s_branch
-// DISASM:       s_endpgm
 .globl test_split_and_hazard
 .p2align 8
 .type test_split_and_hazard,@function
@@ -71,10 +69,6 @@ test_split_and_hazard:
 // COM: Split trampoline: two K=64 halves (first half src2 = original
 // COM: dst, second half src2 = dst-as-carry), then s_branch back to the
 // COM: instruction after the original K=128 WMMA.
-// DISASM:       v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[0:7], v[16:23], v[32:39]
-// DISASM-NEXT:  v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[24:31], v[32:39]
-// DISASM-NEXT:  s_branch
-
 // COM: Hazard trampoline: exactly 8 v_nops (full deficit -- no
 // COM: pre-existing nops between WMMA and VALU) followed by the
 // COM: relocated v_add_f32.

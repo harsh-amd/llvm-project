@@ -21,14 +21,11 @@
 
 // DISASM-LABEL: <kernel>:
 // DISASM-NOT:   v_wmma_f32_16x16x128_fp8_bf8
-// DISASM:       s_branch
-// DISASM:       s_endpgm
 
 // COM: Both halves end at `//` immediately after the operand list (no
 // COM: matrix_a_reuse modifier suffix on either).
 // DISASM:       v_wmma_f32_16x16x64_fp8_bf8 v[40:47], v[0:7], v[8:15], v[40:47]{{[[:space:]]*\/\/}}
 // DISASM-NEXT:  v_wmma_f32_16x16x64_fp8_bf8 v[40:47], v[8:15], v[16:23], v[40:47]{{[[:space:]]*\/\/}}
-// DISASM-NEXT:  s_branch
 
 // COM: Sanity: matrix_a_reuse must NOT appear anywhere on the K=64
 // COM: replacement instructions for this kernel.

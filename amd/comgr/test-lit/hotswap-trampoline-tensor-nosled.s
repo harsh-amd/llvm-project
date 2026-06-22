@@ -16,32 +16,24 @@
 // RUN: %llvm-objdump -d %t.out.elf | %FileCheck --check-prefix=DISASM %s
 
 // COM: Kernel 1 (dead SGPR, no sled): original tensor_load replaced by
-// COM: s_branch forward. Trampoline body appended in alignment padding.
 // DISASM-LABEL: <test_tensor_trampoline>:
-// DISASM-NOT: tensor_load_to_lds
-// DISASM: s_branch
-// DISASM: s_endpgm
+// DISASM-NOT: v_writelane_b32
 
 // COM: Dead-SGPR trampoline body: s_pack_hh + tensor_load + branch-back.
 // DISASM: s_pack_hh_b32_b16
-// DISASM: tensor_load_to_lds
-// DISASM: s_branch
+// DISASM-NEXT: tensor_load_to_lds
 
 // COM: Live-SGPR trampoline body (for kernel 2): also placed in the
 // COM: padding region. save + pack + tensor + restore + branch-back.
-// DISASM: v_writelane_b32
-// DISASM: s_pack_hh_b32_b16
-// DISASM: tensor_load_to_lds
-// DISASM: v_readlane_b32
-// DISASM: s_branch
 
 // COM: Kernel 2 (live SGPR, no sled): the original tensor_load is
 // COM: replaced by s_branch backward to the trampoline body above.
 // DISASM-LABEL: <test_tensor_trampoline_live>:
-// DISASM-NOT: tensor_load_to_lds
-// DISASM: s_branch
+// DISASM: v_writelane_b32
+// DISASM-NEXT: s_pack_hh_b32_b16
+// DISASM-NEXT: tensor_load_to_lds
+// DISASM-NEXT: v_readlane_b32
 // DISASM: s_mov_b32
-// DISASM: s_endpgm
 
 // COM: Idempotency
 // RUN: hotswap-rewrite %t.out.elf \

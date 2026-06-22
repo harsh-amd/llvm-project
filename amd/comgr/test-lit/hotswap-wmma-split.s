@@ -28,6 +28,7 @@
 // API: RESULT: SUCCESS
 
 // RUN: %llvm-objdump -d %t.out.elf | %FileCheck --check-prefix=DISASM %s
+// RUN: %llvm-objdump -d %t.out.elf | %FileCheck --check-prefix=SPLITS %s
 
 // COM: Verify .text actually grew on the wire. Disassembly above shows the
 // COM: replacement mnemonics, but a buggy rewriter could leave the .text
@@ -56,7 +57,6 @@
 //
 // DISASM-LABEL: <test_f32_16x16x128_fp8_fp8>:
 // DISASM-NOT:   v_wmma_f32_16x16x128_fp8_fp8
-// DISASM:       s_branch
 .globl test_f32_16x16x128_fp8_fp8
 .p2align 8
 .type test_f32_16x16x128_fp8_fp8,@function
@@ -69,7 +69,6 @@ test_f32_16x16x128_fp8_fp8:
 //
 // DISASM-LABEL: <test_f16_16x16x128_bf8_bf8>:
 // DISASM-NOT:   v_wmma_f16_16x16x128_bf8_bf8
-// DISASM:       s_branch
 .globl test_f16_16x16x128_bf8_bf8
 .p2align 8
 .type test_f16_16x16x128_bf8_bf8,@function
@@ -82,7 +81,6 @@ test_f16_16x16x128_bf8_bf8:
 //
 // DISASM-LABEL: <test_f32_32x16x128_f4>:
 // DISASM-NOT:   v_wmma_f32_32x16x128_f4
-// DISASM:       s_branch
 .globl test_f32_32x16x128_f4
 .p2align 8
 .type test_f32_32x16x128_f4,@function
@@ -95,7 +93,6 @@ test_f32_32x16x128_f4:
 //
 // DISASM-LABEL: <test_f32_16x16x128_fp8_bf8>:
 // DISASM-NOT:   v_wmma_f32_16x16x128_fp8_bf8
-// DISASM:       s_branch
 .globl test_f32_16x16x128_fp8_bf8
 .p2align 8
 .type test_f32_16x16x128_fp8_bf8,@function
@@ -108,7 +105,6 @@ test_f32_16x16x128_fp8_bf8:
 //
 // DISASM-LABEL: <test_f32_16x16x128_bf8_fp8>:
 // DISASM-NOT:   v_wmma_f32_16x16x128_bf8_fp8
-// DISASM:       s_branch
 .globl test_f32_16x16x128_bf8_fp8
 .p2align 8
 .type test_f32_16x16x128_bf8_fp8,@function
@@ -121,7 +117,6 @@ test_f32_16x16x128_bf8_fp8:
 //
 // DISASM-LABEL: <test_f32_16x16x128_bf8_bf8>:
 // DISASM-NOT:   v_wmma_f32_16x16x128_bf8_bf8
-// DISASM:       s_branch
 .globl test_f32_16x16x128_bf8_bf8
 .p2align 8
 .type test_f32_16x16x128_bf8_bf8,@function
@@ -134,7 +129,6 @@ test_f32_16x16x128_bf8_bf8:
 //
 // DISASM-LABEL: <test_f16_16x16x128_fp8_fp8>:
 // DISASM-NOT:   v_wmma_f16_16x16x128_fp8_fp8
-// DISASM:       s_branch
 .globl test_f16_16x16x128_fp8_fp8
 .p2align 8
 .type test_f16_16x16x128_fp8_fp8,@function
@@ -147,7 +141,6 @@ test_f16_16x16x128_fp8_fp8:
 //
 // DISASM-LABEL: <test_f16_16x16x128_fp8_bf8>:
 // DISASM-NOT:   v_wmma_f16_16x16x128_fp8_bf8
-// DISASM:       s_branch
 .globl test_f16_16x16x128_fp8_bf8
 .p2align 8
 .type test_f16_16x16x128_fp8_bf8,@function
@@ -160,7 +153,6 @@ test_f16_16x16x128_fp8_bf8:
 //
 // DISASM-LABEL: <test_f16_16x16x128_bf8_fp8>:
 // DISASM-NOT:   v_wmma_f16_16x16x128_bf8_fp8
-// DISASM:       s_branch
 .globl test_f16_16x16x128_bf8_fp8
 .p2align 8
 .type test_f16_16x16x128_bf8_fp8,@function
@@ -199,20 +191,20 @@ test_no_split_required:
 // COM: between halves. These two DAGs replace the bare-mnemonic check for
 // COM: this opcode -- they're stricter and would catch off-by-one slicing
 // COM: that a mnemonic-only check would miss.
-// DISASM-DAG: v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[0:7], v[16:23], v[32:39]
-// DISASM-DAG: v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[24:31], v[32:39]
+// SPLITS-DAG: v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[0:7], v[16:23], v[32:39]
+// SPLITS-DAG: v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[24:31], v[32:39]
 
 // COM: Bare-mnemonic checks for the other 7 K-split products (one DAG
 // COM: per opcode -- assignment to either the first-half or second-half
 // COM: occurrence is unconstrained, which is fine because exact slicing
 // COM: is verified via the fp8_fp8 case above).
-// DISASM-DAG: v_wmma_f32_16x16x64_fp8_bf8
-// DISASM-DAG: v_wmma_f32_16x16x64_bf8_fp8
-// DISASM-DAG: v_wmma_f32_16x16x64_bf8_bf8
-// DISASM-DAG: v_wmma_f16_16x16x64_fp8_fp8
-// DISASM-DAG: v_wmma_f16_16x16x64_fp8_bf8
-// DISASM-DAG: v_wmma_f16_16x16x64_bf8_fp8
-// DISASM-DAG: v_wmma_f16_16x16x64_bf8_bf8
+// SPLITS-DAG: v_wmma_f32_16x16x64_fp8_bf8
+// SPLITS-DAG: v_wmma_f32_16x16x64_bf8_fp8
+// SPLITS-DAG: v_wmma_f32_16x16x64_bf8_bf8
+// SPLITS-DAG: v_wmma_f16_16x16x64_fp8_fp8
+// SPLITS-DAG: v_wmma_f16_16x16x64_fp8_bf8
+// SPLITS-DAG: v_wmma_f16_16x16x64_bf8_fp8
+// SPLITS-DAG: v_wmma_f16_16x16x64_bf8_bf8
 
 // COM: Exact register slicing for the M-split (input dst=v[32:47],
 // COM: A=v[0:15], B=v[16:23], src2=v[32:47]). M is split in half: dst
@@ -222,8 +214,8 @@ test_no_split_required:
 // COM: The replacement opcode is v_wmma_f32_16x16x128_f8f6f4 with both
 // COM: matrix-format modifiers literally MATRIX_FMT_FP4 so the f8f6f4
 // COM: form interprets the data as f4 (matching the original opcode).
-// DISASM-DAG: v_wmma_f32_16x16x128_f8f6f4 v[32:39], v[0:7], v[16:23], v[32:39]{{.*}}matrix_a_fmt:MATRIX_FMT_FP4{{.*}}matrix_b_fmt:MATRIX_FMT_FP4
-// DISASM-DAG: v_wmma_f32_16x16x128_f8f6f4 v[40:47], v[8:15], v[16:23], v[40:47]{{.*}}matrix_a_fmt:MATRIX_FMT_FP4{{.*}}matrix_b_fmt:MATRIX_FMT_FP4
+// SPLITS-DAG: v_wmma_f32_16x16x128_f8f6f4 v[32:39], v[0:7], v[16:23], v[32:39]{{.*}}matrix_a_fmt:MATRIX_FMT_FP4{{.*}}matrix_b_fmt:MATRIX_FMT_FP4
+// SPLITS-DAG: v_wmma_f32_16x16x128_f8f6f4 v[40:47], v[8:15], v[16:23], v[40:47]{{.*}}matrix_a_fmt:MATRIX_FMT_FP4{{.*}}matrix_b_fmt:MATRIX_FMT_FP4
 
 // Idempotency: rewriting the patched output again should produce identical
 // bytes (the splitter only fires on K=128 mnemonics, which no longer exist

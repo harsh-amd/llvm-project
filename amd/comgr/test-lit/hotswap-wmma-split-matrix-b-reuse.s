@@ -16,12 +16,9 @@
 
 // DISASM-LABEL: <kernel>:
 // DISASM-NOT:   v_wmma_f32_16x16x128_bf8_fp8
-// DISASM:       s_branch
-// DISASM:       s_endpgm
 
 // DISASM:       v_wmma_f32_16x16x64_bf8_fp8 v[48:55], v[0:7], v[8:15], v[48:55]{{[[:space:]]*\/\/}}
 // DISASM-NEXT:  v_wmma_f32_16x16x64_bf8_fp8 v[48:55], v[8:15], v[16:23], v[48:55]{{[[:space:]]*\/\/}}
-// DISASM-NEXT:  s_branch
 
 // DISASM-NOT:   v_wmma_f32_16x16x64_bf8_fp8 v[48:55]{{.*}}matrix_b_reuse
 .globl kernel

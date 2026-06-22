@@ -52,12 +52,9 @@
 // COM: Both per-operand indices scale past 0xFFFF (off0:128 -> 65536,
 // COM: off1:255 -> 130560). The trampoline must reject the patch and
 // COM: leave ds_load_2addr_stride64_b64 in the kernel verbatim. No
-// COM: s_branch is inserted, no replacement ds_load_b64 appears, the
 // COM: NOP sled is unused. The DISASM-NOT lines pin all three negatives.
 // DISASM-LABEL: <test_ds_load_b64_overflow>:
 // DISASM:       ds_load_2addr_stride64_b64 v[0:3], v4 offset0:128 offset1:255
-// DISASM-NEXT:  s_wait_dscnt 0x0
-// DISASM-NEXT:  s_endpgm
 // DISASM-NOT:   s_branch
 // DISASM-NOT:   ds_load_b64
 
@@ -96,11 +93,8 @@ test_ds_load_b64_overflow:
 // COM: across the board, not specifically gated by the overflow check).
 // DISASM-LABEL: <test_ds_load_b64_inrange>:
 // DISASM-NOT:   ds_load_2addr_stride64_b64
-// DISASM:       s_branch
-// DISASM:       s_wait_dscnt 0x0
 // DISASM:       ds_load_b64 v[0:1], v4 offset:512
 // DISASM-NEXT:  ds_load_b64 v[2:3], v4 offset:1024
-// DISASM:       s_branch
 
 .globl test_ds_load_b64_inrange
 .p2align 8

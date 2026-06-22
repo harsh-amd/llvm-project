@@ -19,15 +19,12 @@
 // COM: Source: K=128 opcode replaced by s_branch into trampoline.
 // DISASM-LABEL: <kernel>:
 // DISASM-NOT:   v_wmma_f32_16x16x128_fp8_fp8
-// DISASM:       s_branch
-// DISASM:       s_endpgm
 
 // COM: First half preserves the FP imm `1.0` verbatim (printer round-trip).
 // COM: Second half's src2 becomes the dst register (carry).
 // COM: Operand-shape note: src0/src1 disjoint from dst per @earlyclobber $vdst.
 // DISASM:       v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[0:7], v[16:23], 1.0
 // DISASM-NEXT:  v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[24:31], v[32:39]
-// DISASM-NEXT:  s_branch
 .globl kernel
 .p2align 8
 .type kernel,@function

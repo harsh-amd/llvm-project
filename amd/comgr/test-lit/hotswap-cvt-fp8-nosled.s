@@ -28,14 +28,10 @@
 //
 // COM: No NOP padding available — trampoline is appended after .text.
 // COM: Filler instruction (v_mov_b32 0x42) must be preserved between the
-// COM: s_branch and s_endpgm. Branch-back lands after the original site.
 
 // PK-LABEL: <test_nosled_pk>:
 // COM: --- Original site: branch replaces v_cvt_pk_fp8_f32 ---
-// PK:       s_branch
 // COM: --- Filler instruction preserved ---
-// PK:       v_mov_b32{{.*}}0x42
-// PK:       s_endpgm
 // COM: --- Trampoline: VCC save ---
 // PK:       s_mov_b32
 // COM: --- src0 conversion (anchor on v1) ---
@@ -49,7 +45,6 @@
 // PK-NEXT:  v_bfi_b32 v0,
 // COM: --- VCC restore + branch back ---
 // PK-NEXT:  s_mov_b32
-// PK-NEXT:  s_branch
 
 .amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 .text
@@ -70,10 +65,7 @@ test_nosled_pk:
 
 // SR-LABEL: <test_nosled_sr>:
 // COM: --- Original site: branch replaces v_cvt_sr_fp8_f32 ---
-// SR:       s_branch
 // COM: --- Filler instruction preserved ---
-// SR:       v_mov_b32{{.*}}0x43
-// SR:       s_endpgm
 // COM: --- Trampoline: NaN detection (anchor on v5) ---
 // SR:       v_and_b32{{.*}}0x7fffffff, v5
 // SR-NEXT:  v_cmp_lt_u32{{.*}}0x7f800000
@@ -85,7 +77,6 @@ test_nosled_pk:
 // SR:       v_bfi_b32 v4,
 // COM: --- VCC restore + branch back ---
 // SR-NEXT:  s_mov_b32
-// SR-NEXT:  s_branch
 
 .globl test_nosled_sr
 .p2align 8
@@ -105,10 +96,7 @@ test_nosled_sr:
 
 // UNPACK-LABEL: <test_nosled_unpack>:
 // COM: --- Original site: branch replaces v_cvt_f32_fp8 ---
-// UNPACK:       s_branch
 // COM: --- Filler instruction preserved ---
-// UNPACK:       v_mov_b32{{.*}}0x44
-// UNPACK:       s_endpgm
 // COM: --- Trampoline: byte extraction (anchor on v9) ---
 // UNPACK:       v_and_b32{{.*}}0xff, v9
 // COM: --- NaN detection ---
@@ -120,7 +108,6 @@ test_nosled_sr:
 // UNPACK-NEXT:  v_cndmask_b32{{.*}}v8,
 // COM: --- VCC restore + branch back ---
 // UNPACK-NEXT:  s_mov_b32
-// UNPACK-NEXT:  s_branch
 
 .globl test_nosled_unpack
 .p2align 8

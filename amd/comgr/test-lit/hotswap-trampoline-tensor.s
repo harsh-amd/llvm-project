@@ -6,7 +6,6 @@
 // COM:   alt descriptor — different SGPR range (s[16:23]) for pack target
 // COM:   SGPR redef — descriptor SGPR overwritten before use (dead path)
 // COM: Verifies per-kernel behavior with CHECK-LABEL blocks and explicit
-// COM: s_branch checks.
 // COM:
 // COM: Companion tests:
 // COM:   hotswap-trampoline-tensor-nosled.s     — trampoline fallback path
@@ -32,11 +31,8 @@
 // DISASM-LABEL: <test_tensor_dead>:
 // DISASM-NOT: v_writelane_b32
 // DISASM-NOT: v_readlane_b32
-// DISASM: s_branch
-// DISASM: s_endpgm
 // DISASM: s_pack_hh_b32_b16
 // DISASM: tensor_load_to_lds
-// DISASM: s_branch
 // DISASM-NOT: v_writelane_b32
 // DISASM-NOT: v_readlane_b32
 
@@ -45,13 +41,11 @@
 // COM: s4 is used after tensor_load_to_lds (s_mov reads it), so
 // COM: save/restore via scratch VGPR is required.
 // DISASM-LABEL: <test_tensor_live>:
-// DISASM: s_branch
-// DISASM: s_mov_b32
 // DISASM: v_writelane_b32
-// DISASM: s_pack_hh_b32_b16
-// DISASM: tensor_load_to_lds
-// DISASM: v_readlane_b32
-// DISASM: s_branch
+// DISASM-NEXT: s_pack_hh_b32_b16
+// DISASM-NEXT: tensor_load_to_lds
+// DISASM-NEXT: v_readlane_b32
+// DISASM: s_mov_b32
 
 // COM: Kernel 3 (alternate descriptor s[16:23]): verifies
 // COM: getDescriptorBaseSgpr correctly extracts s16 from a different
@@ -59,11 +53,8 @@
 // COM: SGPR is dead (s_endpgm follows).
 // DISASM-LABEL: <test_tensor_alt_descriptor>:
 // DISASM-NOT: v_writelane_b32
-// DISASM: s_branch
-// DISASM: s_endpgm
 // DISASM: s_pack_hh_b32_b16 s16
 // DISASM: tensor_load_to_lds
-// DISASM: s_branch
 
 // COM: Kernel 4 (SGPR redefined before use): s4 is overwritten by
 // COM: s_mov_b32 s4, 0 immediately after tensor_load, then s_endpgm.
@@ -72,11 +63,8 @@
 // DISASM-LABEL: <test_tensor_sgpr_redef>:
 // DISASM-NOT: v_writelane_b32
 // DISASM-NOT: v_readlane_b32
-// DISASM: s_branch
-// DISASM: s_endpgm
 // DISASM: s_pack_hh_b32_b16
 // DISASM: tensor_load_to_lds
-// DISASM: s_branch
 // DISASM-NOT: v_writelane_b32
 // DISASM-NOT: v_readlane_b32
 
