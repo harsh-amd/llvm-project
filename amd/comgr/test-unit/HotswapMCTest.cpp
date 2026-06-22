@@ -440,6 +440,9 @@ TEST(BuildKernelEntryTrampoline, BuildsRecognizedPcRelativeStub) {
 
   constexpr uint64_t StubVAddr = 0x200000;
   constexpr uint64_t EntryVAddr = 0x10100;
+  llvm::SmallVector<uint8_t> GlobalWb = assembleSingleInst("global_wb", S);
+  ASSERT_EQ(GlobalWb.size(), 3 * MinInstSize);
+
   llvm::SmallVector<uint8_t> Bytes =
       buildKernelEntryTrampoline(StubVAddr, EntryVAddr, S);
 
@@ -648,6 +651,69 @@ TEST(TextDisplacement, UpdatesKernelDescriptorEntryOffset) {
             static_cast<int64_t>(0x1000 - (0x2000 + Prefix.size())));
   EXPECT_TRUE(isKernelEntryDisplacementPrefix(
       llvm::ArrayRef<uint8_t>(OutView->textData(), Prefix.size()), S));
+}
+
+TEST(KernelEntryTrampoline, ClearsInstPrefSizeForAppendedStub) {
+  namespace hsa = llvm::amdhsa;
+
+  LLVMState S = initLLVM(makeGfx1250Ident());
+  ASSERT_TRUE(S.Valid);
+
+  llvm::SmallVector<uint8_t> Text = assembleSingleInst("s_endpgm", S);
+  ASSERT_EQ(Text.size(), MinInstSize);
+  std::vector<uint8_t> ElfBytes = makeDisplacementTestElf(Text);
+  llvm::Expected<ElfView> ViewOrErr =
+      ElfView::create(ElfBytes.data(), ElfBytes.size());
+  ASSERT_TRUE((bool)ViewOrErr) << llvm::toString(ViewOrErr.takeError());
+
+  uint8_t *Kd = ViewOrErr->findKernelDescriptor("kernel");
+  ASSERT_NE(Kd, nullptr);
+  uint32_t Rsrc3 = 0;
+  AMDHSA_BITS_SET(Rsrc3,
+                  hsa::COMPUTE_PGM_RSRC3_GFX12_PLUS_INST_PREF_SIZE, 7);
+  Rsrc3 |= hsa::COMPUTE_PGM_RSRC3_GFX12_PLUS_GLG_EN;
+  std::memcpy(Kd + offsetof(hsa::kernel_descriptor_t, compute_pgm_rsrc3),
+              &Rsrc3, sizeof(Rsrc3));
+
+  const uint64_t StubVAddr = ViewOrErr->textAddr() + ViewOrErr->textSize();
+  llvm::SmallVector<uint8_t> Stub =
+      buildKernelEntryTrampoline(StubVAddr, ViewOrErr->textAddr(), S);
+  ASSERT_EQ(Stub.size(), KernelEntryStubStride);
+
+  Trampoline T;
+  T.Bytes.assign(Stub.begin(), Stub.end());
+  std::unique_ptr<llvm::WritableMemoryBuffer> Out =
+      ViewOrErr->growWithTrampolines({T}, S.SNopBytes);
+  ASSERT_NE(Out, nullptr);
+
+  KernelEntryTrampolineFixup Fixup{"kernel", 0};
+  ASSERT_TRUE(rewriteKernelEntryDescriptorOffsets(*Out, ViewOrErr->textSize(),
+                                                  {Fixup}, S.Cpu));
+
+  uint8_t *OutData = reinterpret_cast<uint8_t *>(Out->getBufferStart());
+  llvm::Expected<ElfView> OutView =
+      ElfView::create(OutData, Out->getBufferSize());
+  ASSERT_TRUE((bool)OutView) << llvm::toString(OutView.takeError());
+
+  uint8_t *OutKd = OutView->findKernelDescriptor("kernel");
+  ASSERT_NE(OutKd, nullptr);
+  uint32_t OutRsrc3 = 0;
+  std::memcpy(&OutRsrc3,
+              OutKd + offsetof(hsa::kernel_descriptor_t, compute_pgm_rsrc3),
+              sizeof(OutRsrc3));
+  EXPECT_EQ(AMDHSA_BITS_GET(
+                OutRsrc3,
+                hsa::COMPUTE_PGM_RSRC3_GFX12_PLUS_INST_PREF_SIZE),
+            0u);
+  EXPECT_NE(OutRsrc3 & hsa::COMPUTE_PGM_RSRC3_GFX12_PLUS_GLG_EN, 0u);
+
+  std::vector<KernelDescriptorInfo> KDs = OutView->kernelDescriptors();
+  ASSERT_EQ(KDs.size(), 1u);
+  std::optional<uint64_t> KdVAddr =
+      OutView->getKernelDescriptorVAddr("kernel");
+  ASSERT_TRUE(KdVAddr.has_value());
+  EXPECT_EQ(KDs[0].EntryOffset,
+            static_cast<int64_t>(StubVAddr - *KdVAddr));
 }
 
 TEST(TextDisplacement, RejectsTextRelocationSections) {
