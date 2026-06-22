@@ -418,7 +418,7 @@ bool executeAssemblerImpl(AssemblerInvocation &Opts, DiagnosticsEngine &Diags,
   std::unique_ptr<MCSubtargetInfo> STI(
       TheTarget->createMCSubtargetInfo(llvm::Triple(Opts.Triple), Opts.CPU, FS));
 
-  MCContext Ctx(Triple(Opts.Triple), *MAI, *MRI, *STI, &SrcMgr);
+  MCContext Ctx(Triple(Opts.Triple), MAI.get(), MRI.get(), STI.get(), &SrcMgr);
   Ctx.setObjectFileInfo(MOFI.get());
 
   bool PIC = false;
@@ -499,7 +499,7 @@ bool executeAssemblerImpl(AssemblerInvocation &Opts, DiagnosticsEngine &Diags,
   // FIXME: init MCTargetOptions from sanitizer flags here.
   MCTargetOptions Options;
   std::unique_ptr<MCTargetAsmParser> TAP(
-      TheTarget->createMCAsmParser(*STI, *Parser, *MCII));
+      TheTarget->createMCAsmParser(*STI, *Parser, *MCII, Options));
   if (!TAP) {
     Failed = Diags.Report(diag::err_target_unknown_triple) << Opts.Triple;
   }
