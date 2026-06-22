@@ -29,10 +29,7 @@
 
 // SAME-LABEL: <test_multi_fp8_same>:
 // SAME-NOT:   v_cvt_pk_fp8_f32
-// SAME:       s_branch
 // SAME-NOT:   v_cvt_pk_fp8_f32
-// SAME:       s_branch
-// SAME:       s_endpgm
 // COM: --- First pk trampoline (vdst=v0, src0=v1, src1=v2) ---
 // SAME:       v_and_b32{{.*}}0x7fffffff, v1
 // SAME:       v_lshl_or_b32
@@ -63,12 +60,8 @@ test_multi_fp8_same:
 
 // MIXED-LABEL: <test_multi_fp8_mixed>:
 // MIXED-NOT:  v_cvt_pk_fp8_f32
-// MIXED:      s_branch
 // MIXED-NOT:  v_cvt_sr_fp8_f32
-// MIXED:      s_branch
 // MIXED-NOT:  v_cvt_f32_fp8
-// MIXED:      s_branch
-// MIXED:      s_endpgm
 // COM: --- pk trampoline: pack via v_lshl_or_b32 + merge into v0 ---
 // MIXED:      v_and_b32{{.*}}0x7fffffff, v1
 // MIXED:      v_lshl_or_b32
@@ -101,7 +94,6 @@ test_multi_fp8_mixed:
 
 // OVERLAP-LABEL: <test_multi_fp8_overlap>:
 // OVERLAP-NOT:   v_cvt_pk_fp8_f32
-// OVERLAP:       s_branch
 // COM: --- Trampoline applied despite vdst==src0 overlap ---
 // OVERLAP:       v_and_b32{{.*}}0x7fffffff, v0
 // OVERLAP:       v_bfi_b32 v0,

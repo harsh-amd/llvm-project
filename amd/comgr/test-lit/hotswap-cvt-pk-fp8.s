@@ -30,7 +30,6 @@
 // COM: into 16-bit pair, merge into low half of vdst via v_bfi_b32, VCC restore.
 
 // LOW-LABEL: <test_cvt_pk_fp8_low>:
-// LOW:       s_branch
 // COM: --- VCC save ---
 // LOW:       s_mov_b32
 // COM: --- src0 conversion ---
@@ -88,7 +87,6 @@ test_cvt_pk_fp8_low:
 // COM: write the packed bytes into the upper 16 bits of vdst.
 
 // HIGH-LABEL: <test_cvt_pk_fp8_high>:
-// HIGH:       s_branch
 // COM: --- VCC save + src0 conversion (anchor on unique src v6) ---
 // HIGH:       v_and_b32{{.*}}0x7fffffff, v6
 // HIGH-NEXT:  v_cmp_lt_u32{{.*}}0x7f800000

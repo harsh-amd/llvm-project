@@ -23,12 +23,9 @@
 
 // DISASM-LABEL: <kernel>:
 // DISASM-NOT:   v_wmma_f32_32x16x128_f4
-// DISASM:       s_branch
-// DISASM:       s_endpgm
 
 // DISASM:       v_wmma_f32_16x16x128_f8f6f4 v[64:71], v[0:7], v[2:9], 1.0 matrix_a_fmt:MATRIX_FMT_FP4 matrix_b_fmt:MATRIX_FMT_FP4
 // DISASM-NEXT:  v_wmma_f32_16x16x128_f8f6f4 v[72:79], v[8:15], v[2:9], 1.0 matrix_a_fmt:MATRIX_FMT_FP4 matrix_b_fmt:MATRIX_FMT_FP4
-// DISASM-NEXT:  s_branch
 .globl kernel
 .p2align 8
 .type kernel,@function

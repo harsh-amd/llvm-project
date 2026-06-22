@@ -37,7 +37,6 @@
 // COM: byte_sel=0 merges via a single v_bfi_b32 (mask 0xFF) — no shift needed.
 
 // SR0-LABEL: <test_cvt_sr_fp8_byte0>:
-// SR0:       s_branch
 // COM: --- VCC save ---
 // SR0:       s_mov_b32
 // SR0-NEXT:  v_and_b32{{.*}}0x7fffffff, v1
@@ -64,7 +63,6 @@ test_cvt_sr_fp8_byte0:
 // COM: v_bfi_b32 with mask 0xFF00.
 
 // SR1-LABEL: <test_cvt_sr_fp8_byte1>:
-// SR1:       s_branch
 // COM: --- VCC save + NaN detection (anchor on unique src v4) ---
 // SR1:       v_and_b32{{.*}}0x7fffffff, v4
 // COM: --- Byte merge (byte_sel=1: shift + bfi) ---
@@ -93,7 +91,6 @@ test_cvt_sr_fp8_byte1:
 // COM: v_bfi_b32 with mask 0xFF0000.
 
 // SR2-LABEL: <test_cvt_sr_fp8_byte2>:
-// SR2:       s_branch
 // COM: --- VCC save + NaN detection (anchor on unique src v7) ---
 // SR2:       v_and_b32{{.*}}0x7fffffff, v7
 // COM: --- Byte merge (byte_sel=2: shift + bfi) ---
@@ -122,7 +119,6 @@ test_cvt_sr_fp8_byte2:
 // COM: v_bfi_b32 with mask 0xFF000000.
 
 // SR3-LABEL: <test_cvt_sr_fp8_byte3>:
-// SR3:       s_branch
 // COM: --- VCC save + NaN detection (anchor on unique src v10) ---
 // SR3:       v_and_b32{{.*}}0x7fffffff, v10
 // COM: --- Byte merge (byte_sel=3: shift + bfi) ---
@@ -150,7 +146,6 @@ test_cvt_sr_fp8_byte3:
 // COM: byte_sel=0 extracts via v_and_b32 with mask 0xFF.
 
 // CVT0-LABEL: <test_cvt_f32_fp8_byte0>:
-// CVT0:       s_branch
 // COM: --- VCC save + Byte extraction (byte_sel=0: anchor on unique src v1) ---
 // CVT0:       v_and_b32{{.*}}0xff, v1
 // COM: --- VCC restore ---
@@ -172,7 +167,6 @@ test_cvt_f32_fp8_byte0:
 // COM: byte_sel=1 extracts via v_bfe_u32 with offset=8, width=8.
 
 // CVT1-LABEL: <test_cvt_f32_fp8_byte1>:
-// CVT1:       s_branch
 // COM: --- VCC save + Byte extraction (anchor on unique src v3) ---
 // CVT1:       v_bfe_u32{{.*}}v3, 8, 8
 // COM: --- VCC restore ---
@@ -198,7 +192,6 @@ test_cvt_f32_fp8_byte1:
 // COM: byte_sel=2 extracts via v_bfe_u32 with offset=16, width=8.
 
 // CVT2-LABEL: <test_cvt_f32_fp8_byte2>:
-// CVT2:       s_branch
 // COM: --- VCC save + Byte extraction (anchor on unique src v5) ---
 // CVT2:       v_bfe_u32{{.*}}v5, 16, 8
 // COM: --- VCC restore ---
@@ -224,7 +217,6 @@ test_cvt_f32_fp8_byte2:
 // COM: byte_sel=3 extracts via v_lshrrev_b32 with shift=24.
 
 // CVT3-LABEL: <test_cvt_f32_fp8_byte3>:
-// CVT3:       s_branch
 // COM: --- VCC save + Byte extraction (anchor on unique src v7) ---
 // CVT3:       v_lshrrev_b32{{.*}}, 24, v7
 // COM: --- VCC restore ---

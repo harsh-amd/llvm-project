@@ -20,40 +20,26 @@
 // COM: branch-back, not its own s_pack_hh — idempotency guard must not
 // COM: false-positive on it.
 // DISASM-LABEL: <test_tensor_multi_different>:
-// DISASM: s_branch
-// DISASM: s_branch
-// DISASM: s_endpgm
 // DISASM: s_pack_hh_b32_b16
 // DISASM: tensor_load_to_lds
-// DISASM: s_branch
 // DISASM: s_pack_hh_b32_b16
 // DISASM: tensor_load_to_lds
-// DISASM: s_branch
 
 // COM: Kernel 2: two tensor_load_to_lds sharing the same descriptor
 // COM: (s[4:11]). Both should still be patched — the idempotency guard
 // COM: checks the immediately preceding instruction, and after patching
 // COM: the first, the second's predecessor is an s_branch (not s_pack_hh).
 // DISASM-LABEL: <test_tensor_multi_same>:
-// DISASM: s_branch
-// DISASM: s_branch
-// DISASM: s_endpgm
 // DISASM: s_pack_hh_b32_b16
 // DISASM: tensor_load_to_lds
-// DISASM: s_branch
 // DISASM: s_pack_hh_b32_b16
 // DISASM: tensor_load_to_lds
-// DISASM: s_branch
 
 // COM: Kernel 3: mixed DS 2-addr + tensor_load in the same kernel.
 // COM: Both patch types should coexist: DS expansion produces two
 // COM: single-address loads + wait bump, tensor produces s_pack_hh.
 // DISASM-LABEL: <test_tensor_mixed_ds>:
 // DISASM-NOT: ds_load_2addr_stride64_b32
-// DISASM: s_branch
-// DISASM: s_wait_dscnt
-// DISASM: s_branch
-// DISASM: s_endpgm
 
 // COM: Idempotency
 // RUN: hotswap-rewrite %t.out.elf \

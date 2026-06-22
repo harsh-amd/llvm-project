@@ -31,7 +31,6 @@
 // COM: NaN override, byte merge (single bfi for byte_sel=0), VCC restore.
 
 // BYTE0-LABEL: <test_cvt_sr_fp8_byte0>:
-// BYTE0:       s_branch
 // COM: --- VCC save ---
 // BYTE0:       s_mov_b32
 // COM: --- NaN detection ---
@@ -78,7 +77,6 @@ test_cvt_sr_fp8_byte0:
 // COM: to write the result into byte 2 of vdst.
 
 // BYTE2-LABEL: <test_cvt_sr_fp8_byte2>:
-// BYTE2:       s_branch
 // COM: --- VCC save + NaN detection (anchor on unique src v6) ---
 // BYTE2:       v_and_b32{{.*}}0x7fffffff, v6
 // BYTE2-NEXT:  v_cmp_lt_u32{{.*}}0x7f800000

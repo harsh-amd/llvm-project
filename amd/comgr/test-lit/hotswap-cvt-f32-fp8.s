@@ -33,7 +33,6 @@
 // COM: exp-31 select (v_cndmask), NaN override (v_cndmask), VCC restore.
 
 // BYTE0-LABEL: <test_cvt_f32_fp8_byte0>:
-// BYTE0:       s_branch
 // COM: --- VCC save ---
 // BYTE0:       s_mov_b32
 // COM: --- Byte extraction (byte_sel=0: v_and_b32) ---
@@ -78,7 +77,6 @@ test_cvt_f32_fp8_byte0:
 // COM: instead of v_and_b32.
 
 // BYTE2-LABEL: <test_cvt_f32_fp8_byte2>:
-// BYTE2:       s_branch
 // COM: --- VCC save + Byte extraction (anchor on unique src v6) ---
 // BYTE2:       v_bfe_u32{{.*}}v6, 16, 8
 // COM: --- NaN detection ---

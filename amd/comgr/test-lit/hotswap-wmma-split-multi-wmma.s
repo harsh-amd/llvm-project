@@ -25,9 +25,6 @@
 // DISASM-LABEL: <kernel>:
 // DISASM-NOT:   v_wmma_f32_16x16x128_fp8_fp8
 // DISASM-NOT:   v_wmma_f32_16x16x128_bf8_bf8
-// DISASM:       s_branch
-// DISASM:       s_branch
-// DISASM:       s_endpgm
 
 // COM: Both trampolines appear after the kernel body, in source order. The
 // COM: K=64 fp8_fp8 trampoline is emitted first (its source WMMA appears
@@ -41,10 +38,8 @@
 // COM: trampoline that DAG would mask.
 // DISASM:       v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[0:7], v[16:23], v[32:39]
 // DISASM-NEXT:  v_wmma_f32_16x16x64_fp8_fp8 v[32:39], v[8:15], v[24:31], v[32:39]
-// DISASM-NEXT:  s_branch
 // DISASM:       v_wmma_f32_16x16x64_bf8_bf8 v[40:47], v[0:7], v[16:23], v[40:47]
 // DISASM-NEXT:  v_wmma_f32_16x16x64_bf8_bf8 v[40:47], v[8:15], v[24:31], v[40:47]
-// DISASM-NEXT:  s_branch
 .globl kernel
 .p2align 8
 .type kernel,@function

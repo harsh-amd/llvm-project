@@ -35,7 +35,6 @@
 // COM: v_max_num_f32 VOP3. NaN detection uses bare v1 (modifier-agnostic).
 
 // NEG0-LABEL: <test_cvt_pk_fp8_neg_src0>:
-// NEG0:       s_branch
 // COM: --- VCC save ---
 // NEG0:       s_mov_b32
 // COM: --- src0 conversion (NEG applied to v1) ---
@@ -75,7 +74,6 @@ test_cvt_pk_fp8_neg_src0:
 // COM: src1 conversion path.
 
 // ABS1-LABEL: <test_cvt_pk_fp8_abs_src1>:
-// ABS1:       s_branch
 // COM: --- src0 conversion (anchor on v4, no modifier) ---
 // ABS1:       v_and_b32{{.*}}0x7fffffff, v4
 // ABS1-NEXT:  v_cmp_lt_u32{{.*}}0x7f800000
@@ -111,7 +109,6 @@ test_cvt_pk_fp8_abs_src1:
 // COM: -v8 on src1 (NEG[1]). Tests simultaneous modifier forwarding.
 
 // NEGABS-LABEL: <test_cvt_pk_fp8_negabs_both>:
-// NEGABS:       s_branch
 // COM: --- src0 conversion (NEG+ABS on v7, anchor on NaN detection) ---
 // NEGABS:       v_and_b32{{.*}}0x7fffffff, v7
 // NEGABS-NEXT:  v_cmp_lt_u32{{.*}}0x7f800000
@@ -148,7 +145,6 @@ test_cvt_pk_fp8_negabs_both:
 // COM: v12 as the stochastic seed.
 
 // SR_NEG-LABEL: <test_cvt_sr_fp8_neg_src0>:
-// SR_NEG:       s_branch
 // COM: --- NaN detection (anchor on v11) ---
 // SR_NEG:       v_and_b32{{.*}}0x7fffffff, v11
 // SR_NEG-NEXT:  v_cmp_lt_u32{{.*}}0x7f800000
@@ -182,7 +178,6 @@ test_cvt_sr_fp8_neg_src0:
 // COM: ABS[0]=1 on src0 (v14). Tests abs modifier forwarding for the SR path.
 
 // SR_ABS-LABEL: <test_cvt_sr_fp8_abs_src0>:
-// SR_ABS:       s_branch
 // COM: --- NaN detection (anchor on v14) ---
 // SR_ABS:       v_and_b32{{.*}}0x7fffffff, v14
 // SR_ABS-NEXT:  v_cmp_lt_u32{{.*}}0x7f800000

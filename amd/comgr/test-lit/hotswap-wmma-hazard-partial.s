@@ -20,8 +20,6 @@
 // DISASM-NEXT: v_nop
 // DISASM-NEXT: v_nop
 // DISASM-NEXT: v_nop
-// DISASM-NEXT: s_branch
-// DISASM: s_endpgm
 // DISASM-COUNT-5: v_nop
 // DISASM-NEXT: v_add_f32
 

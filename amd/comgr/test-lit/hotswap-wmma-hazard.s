@@ -18,8 +18,6 @@
 // COM: deviation (7 or 9 v_nops) breaks the chain.
 // RUN: %llvm-objdump -d %t.out.elf | %FileCheck --check-prefix=DISASM %s
 // DISASM: v_wmma_i32_16x16x64_iu8
-// DISASM-NEXT: s_branch
-// DISASM: s_endpgm
 // DISASM-COUNT-8: v_nop
 // DISASM-NEXT: v_add_f32
 

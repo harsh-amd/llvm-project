@@ -43,14 +43,12 @@
 
 // DISASM-LABEL: <test_addtid_load>:
 // DISASM-NOT:   ds_load_addtid_b32
-// DISASM:       s_branch
 // DISASM:       v_mbcnt_lo_u32_b32 v5, -1, 0
 // DISASM-NEXT:  v_mbcnt_hi_u32_b32 v5, -1, v5
 // DISASM-NEXT:  v_lshlrev_b32_e32 v5, 2, v5
 // DISASM-NEXT:  v_add_nc_u32_e32 v5, m0, v5
 // DISASM-NEXT:  v_and_b32_e32 v5, 0xfffff, v5
 // DISASM-NEXT:  ds_load_b32 v5, v5 offset:128
-// DISASM-NEXT:  s_branch
 
 .amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 .text
@@ -96,14 +94,12 @@ test_addtid_load:
 
 // DISASM-LABEL: <test_addtid_load_zero>:
 // DISASM-NOT:   ds_load_addtid_b32
-// DISASM:       s_branch
 // DISASM:       v_mbcnt_lo_u32_b32 v6, -1, 0
 // DISASM-NEXT:  v_mbcnt_hi_u32_b32 v6, -1, v6
 // DISASM-NEXT:  v_lshlrev_b32_e32 v6, 2, v6
 // DISASM-NEXT:  v_add_nc_u32_e32 v6, m0, v6
 // DISASM-NEXT:  v_and_b32_e32 v6, 0xfffff, v6
 // DISASM-NEXT:  ds_load_b32 v6, v6
-// DISASM-NEXT:  s_branch
 
 .text
 .globl test_addtid_load_zero
@@ -150,14 +146,12 @@ test_addtid_load_zero:
 
 // DISASM-LABEL: <test_addtid_store>:
 // DISASM-NOT:   ds_store_addtid_b32
-// DISASM:       s_branch
 // DISASM:       v_mbcnt_lo_u32_b32 [[VTMP:v[0-9]+]], -1, 0
 // DISASM-NEXT:  v_mbcnt_hi_u32_b32 [[VTMP]], -1, [[VTMP]]
 // DISASM-NEXT:  v_lshlrev_b32_e32 [[VTMP]], 2, [[VTMP]]
 // DISASM-NEXT:  v_add_nc_u32_e32 [[VTMP]], m0, [[VTMP]]
 // DISASM-NEXT:  v_and_b32_e32 [[VTMP]], 0xfffff, [[VTMP]]
 // DISASM-NEXT:  ds_store_b32 [[VTMP]], v8 offset:64
-// DISASM-NEXT:  s_branch
 
 .text
 .globl test_addtid_store

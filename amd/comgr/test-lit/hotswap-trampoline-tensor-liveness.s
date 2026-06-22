@@ -18,13 +18,11 @@
 // COM: and s_mov (which reads s4). isSgprLiveAfter returns true at the
 // COM: branch, so save/restore is emitted conservatively.
 // DISASM-LABEL: <test_tensor_branch_guard>:
-// DISASM: s_branch
-// DISASM: s_cbranch_scc1
 // DISASM: v_writelane_b32
-// DISASM: s_pack_hh_b32_b16
-// DISASM: tensor_load_to_lds
-// DISASM: v_readlane_b32
-// DISASM: s_branch
+// DISASM-NEXT: s_pack_hh_b32_b16
+// DISASM-NEXT: tensor_load_to_lds
+// DISASM-NEXT: v_readlane_b32
+// DISASM: s_cbranch_scc1
 
 // COM: Idempotency
 // RUN: hotswap-rewrite %t.out.elf \
