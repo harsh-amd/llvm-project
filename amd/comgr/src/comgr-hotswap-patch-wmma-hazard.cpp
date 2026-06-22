@@ -179,23 +179,23 @@ static uint32_t applyWmmaHazardPatchImpl(PatchContext &Ctx) {
   for (const WmmaHazard &H : Hazards) {
     const InternalDecodedInst &ValuDI = Ctx.Decoded[H.ValuIdx];
 
-    uint64_t TrampolineTextOffset = Ctx.TextSize;
-    for (const Trampoline &T : Ctx.OutTrampolines)
-      TrampolineTextOffset += T.Bytes.size();
-
-    SmallVector<MCInst> Insts;
-    for (int I = 0; I < H.Deficit; ++I)
-      Insts.push_back(Ctx.LS.VNopInst);
-    Insts.push_back(ValuDI.Inst);
-
-    Trampoline T = buildTrampoline(Insts, ValuDI.Offset, ValuDI.Size,
-                                   TrampolineTextOffset, Ctx.LS);
-    if (T.Bytes.empty()) {
-      log() << "hotswap: error: WMMA hazard: buildTrampoline failed at 0x"
+    SmallVector<uint8_t> VNopBytes = assembleSingleInst("v_nop", Ctx.LS);
+    if (VNopBytes.empty()) {
+      log() << "hotswap: error: WMMA hazard: failed to assemble v_nop at 0x"
             << utohexstr(ValuDI.Offset) << "\n";
       continue;
     }
-    Ctx.OutTrampolines.push_back(std::move(T));
+    SmallVector<uint8_t> Replacement;
+    for (int I = 0; I < H.Deficit; ++I)
+      Replacement.append(VNopBytes.begin(), VNopBytes.end());
+    Replacement.append(Ctx.Text + ValuDI.Offset,
+                       Ctx.Text + ValuDI.Offset + ValuDI.Size);
+
+    if (!emitReplacementCode(Ctx, ValuDI.Offset, ValuDI.Size, Replacement)) {
+      log() << "hotswap: error: WMMA hazard: replacement emission failed at 0x"
+            << utohexstr(ValuDI.Offset) << "\n";
+      continue;
+    }
 
     log() << "hotswap: WMMA hazard fix at 0x" << utohexstr(ValuDI.Offset)
           << ": inserted " << H.Deficit << " v_nop(s)\n";

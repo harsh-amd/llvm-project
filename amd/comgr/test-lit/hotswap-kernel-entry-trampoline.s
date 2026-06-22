@@ -1,5 +1,5 @@
-// COM: HotSwap redirects kernel descriptors to appended PC-relative entry
-// COM: stubs only when the entry-trampoline flag is enabled.
+// COM: HotSwap inserts the entry workaround directly at kernel entry when the
+// COM: entry-trampoline flag is enabled.
 
 // RUN: %clang -target amdgcn-amd-amdhsa -mcpu=gfx1250 -nostdlib %s -o %t.elf
 
@@ -17,7 +17,8 @@
 // RUN: cmp %t.elf %t.disabled.elf
 // RUN: %llvm-objdump -d %t.disabled.elf | %FileCheck --check-prefix=NO-TRAMP %s
 // NO-TRAMP-LABEL: <entry_tramp_kernel>:
-// NO-TRAMP: s_endpgm
+// NO-TRAMP-NEXT: v_mov_b32_e32 v0, 0
+// NO-TRAMP-NEXT: s_endpgm
 // NO-TRAMP-NOT: global_wb
 
 // RUN: AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES=1 hotswap-rewrite %t.elf \
@@ -57,13 +58,11 @@
 // RUN: %llvm-objdump -d %t.a0b0.elf | %FileCheck --check-prefix=DISASM %s
 
 // DISASM-LABEL: <entry_tramp_kernel>:
-// DISASM: s_endpgm
-// DISASM: global_wb
+// DISASM-NEXT: global_wb
 // DISASM-NEXT: v_nop
-// DISASM-NEXT: s_get_pc_i64 s[100:101]
-// DISASM-NEXT: s_add_co_u32 s100
-// DISASM-NEXT: s_add_co_ci_u32 s101
-// DISASM-NEXT: s_set_pc_i64 s[100:101]
+// DISASM-NEXT: v_mov_b32_e32 v0, 0
+// DISASM-NEXT: s_endpgm
+// DISASM-NOT: s_get_pc_i64
 
 // RUN: AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES=1 hotswap-rewrite %t.out.elf \
 // RUN:   amdgcn-amd-amdhsa--gfx1250 amdgcn-amd-amdhsa--gfx1250 \

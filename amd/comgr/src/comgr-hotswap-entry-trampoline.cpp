@@ -119,6 +119,40 @@ bool isKernelEntryTrampoline(ArrayRef<uint8_t> Bytes, const LLVMState &LS) {
          Decoded[5].Inst.getOpcode() == LS.SSetPcI64Opcode;
 }
 
+bool isKernelEntryDisplacementPrefix(ArrayRef<uint8_t> Bytes,
+                                     const LLVMState &LS) {
+  if (Bytes.empty())
+    return false;
+
+  if (!LS.MCII || LS.GlobalWbOpcode >= LS.MCII->getNumOpcodes()) {
+    log() << "hotswap: error: isKernelEntryDisplacementPrefix: LLVMState "
+          << "lacks resolved entry-prefix opcodes.\n";
+    return false;
+  }
+
+  std::vector<InternalDecodedInst> Decoded;
+  if (!decodeTextSection(Bytes.data(), Bytes.size(), LS, Decoded)) {
+    log() << "hotswap: error: isKernelEntryDisplacementPrefix: failed to "
+          << "decode candidate.\n";
+    return false;
+  }
+  if (Decoded.size() < 2)
+    return false;
+
+  return Decoded[0].Inst.getOpcode() == LS.GlobalWbOpcode &&
+         Decoded[1].Inst.getOpcode() == LS.VNopInst.getOpcode();
+}
+
+static SmallVector<uint8_t> buildKernelEntryDisplacementPrefix(
+    const LLVMState &LS) {
+  SmallVector<uint8_t> Prefix;
+  if (!appendAsm(Prefix, "global_wb", LS))
+    return {};
+  if (!appendAsm(Prefix, "v_nop", LS))
+    return {};
+  return Prefix;
+}
+
 static uint64_t entryVAddr(const KernelDescriptorInfo &KD) {
   return KD.VAddr + static_cast<uint64_t>(KD.EntryOffset);
 }
@@ -130,6 +164,11 @@ static bool descriptorAlreadyTargetsEntryStub(const ElfView &Elf,
   if (Entry < Elf.textAddr())
     return false;
   const uint64_t TextOffset = Entry - Elf.textAddr();
+  SmallVector<uint8_t> Prefix = buildKernelEntryDisplacementPrefix(LS);
+  if (!Prefix.empty() && TextOffset + Prefix.size() <= Elf.textSize() &&
+      isKernelEntryDisplacementPrefix(
+          ArrayRef<uint8_t>(Elf.textData() + TextOffset, Prefix.size()), LS))
+    return true;
   if (TextOffset + KernelEntryStubStride > Elf.textSize())
     return false;
   return isKernelEntryTrampoline(
@@ -164,6 +203,56 @@ static bool appendPaddingTrampoline(std::vector<Trampoline> &Out,
     Pad.Bytes.append(Fill.begin(), Fill.end());
   Out.push_back(std::move(Pad));
   return true;
+}
+
+std::optional<uint32_t> collectKernelEntryDisplacements(
+    const ElfView &Elf, const LLVMState &LS,
+    std::vector<DisplacementEdit> &OutEdits) {
+  std::vector<KernelDescriptorInfo> Descriptors = Elf.kernelDescriptors();
+  if (Descriptors.empty())
+    return 0;
+
+  SmallVector<uint8_t> Prefix = buildKernelEntryDisplacementPrefix(LS);
+  if (Prefix.empty())
+    return std::nullopt;
+
+  uint32_t Added = 0;
+  for (const KernelDescriptorInfo &KD : Descriptors) {
+    if (descriptorAlreadyTargetsEntryStub(Elf, KD, LS))
+      continue;
+
+    const uint64_t Entry = entryVAddr(KD);
+    if (Entry < Elf.textAddr() || Entry > Elf.textAddr() + Elf.textSize()) {
+      log() << "hotswap: error: kernel-entry displacement for '"
+            << KD.KernelName << "' points outside .text at vaddr 0x"
+            << utohexstr(Entry) << ".\n";
+      return std::nullopt;
+    }
+    const uint64_t TextOffset = Entry - Elf.textAddr();
+
+    bool DuplicateOffset = false;
+    for (const DisplacementEdit &Existing : OutEdits) {
+      if (Existing.Offset == TextOffset && Existing.OriginalSize == 0) {
+        DuplicateOffset = true;
+        break;
+      }
+    }
+    if (DuplicateOffset)
+      continue;
+
+    DisplacementEdit Edit;
+    Edit.Offset = TextOffset;
+    Edit.OriginalSize = 0;
+    Edit.ReplacementBytes.assign(Prefix.begin(), Prefix.end());
+    Edit.KernelName = KD.KernelName;
+    OutEdits.push_back(std::move(Edit));
+    ++Added;
+  }
+
+  if (Added > 0)
+    log() << "hotswap: queued " << Added << " kernel-entry displacement"
+          << (Added == 1 ? "" : "s") << "\n";
+  return Added;
 }
 
 std::optional<uint32_t> appendKernelEntryTrampolines(

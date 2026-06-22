@@ -208,15 +208,12 @@ static uint32_t patchWmmaScale16_16x16(PatchContext &Ctx, size_t Idx) {
     return 0;
   }
 
-  // Skip offsets another patch has already claimed (Trampoline entries
-  // are appended to OutTrampolines before fixupTrampolineBranches
-  // overwrites the original site with s_branch). Mirrors PR #2's wrap
-  // pass; the previous `Decoded[Idx-1] == s_branch` heuristic never
-  // fired meaningfully because Decoded[] is built from the original
-  // .text and the dispatcher's mnemonic narrowing already filters out
-  // sites the patch has rewritten on a re-rewrite.
+  // Skip offsets another patch has already claimed.
   for (const Trampoline &T : Ctx.OutTrampolines)
     if (T.OriginalOffset == DI.Offset)
+      return 0;
+  for (const DisplacementEdit &Edit : Ctx.OutDisplacements)
+    if (Edit.Offset == DI.Offset)
       return 0;
 
   const uint8_t *Raw = Ctx.Text + DI.Offset;
@@ -313,7 +310,7 @@ static uint32_t patchWmmaScale16_16x16(PatchContext &Ctx, size_t Idx) {
                      PreambleBytes.end());
   Replacement.insert(Replacement.end(), WmmaBytes.begin(), WmmaBytes.end());
 
-  if (!emitToTrampoline(Ctx, DI.Offset, DI.Size, Replacement))
+  if (!emitReplacementCode(Ctx, DI.Offset, DI.Size, Replacement))
     return 0;
 
   KernelPatchStats &Stats = Ctx.KernelStats[KernelName];
@@ -504,10 +501,12 @@ static uint32_t patchWmmaScale16_32x16(PatchContext &Ctx, size_t Idx) {
     return 0;
   }
 
-  // Skip offsets another patch has already claimed. Mirrors the 16x16
-  // path (see patchWmmaScale16_16x16 for the rationale).
+  // Skip offsets another patch has already claimed. Mirrors the 16x16 path.
   for (const Trampoline &T : Ctx.OutTrampolines)
     if (T.OriginalOffset == DI.Offset)
+      return 0;
+  for (const DisplacementEdit &Edit : Ctx.OutDisplacements)
+    if (Edit.Offset == DI.Offset)
       return 0;
 
   const uint8_t *Raw = Ctx.Text + DI.Offset;
@@ -697,7 +696,7 @@ static uint32_t patchWmmaScale16_32x16(PatchContext &Ctx, size_t Idx) {
     Replacement.insert(Replacement.end(), HalfBytes.begin(), HalfBytes.end());
   }
 
-  if (!emitToTrampoline(Ctx, DI.Offset, DI.Size, Replacement))
+  if (!emitReplacementCode(Ctx, DI.Offset, DI.Size, Replacement))
     return 0;
 
   KernelPatchStats &Stats = Ctx.KernelStats[KernelName];
