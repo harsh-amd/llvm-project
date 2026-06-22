@@ -291,20 +291,74 @@ buildNopSledMap(ArrayRef<InternalDecodedInst> Decoded, const LLVMState &LS) {
   return true;
 }
 
+[[nodiscard]] bool
+emitReplacementFallback(uint8_t *Text, uint64_t TextSize, const LLVMState &LS,
+                        std::vector<NopSled> &NopSleds,
+                        std::vector<Trampoline> &OutTrampolines,
+                        uint64_t InstOffset, uint32_t InstSize,
+                        ArrayRef<uint8_t> Replacement) {
+  uint64_t Needed = Replacement.size() + MinInstSize;
+  if (NopSled *Sled = findNearestSled(NopSleds, InstOffset, Needed)) {
+    std::memcpy(Text + Sled->WritePos, Replacement.data(),
+                Replacement.size());
+
+    SmallVector<uint8_t> BrBack =
+        LS.encodeSBranch(Sled->WritePos + Replacement.size(),
+                         InstOffset + InstSize);
+    if (BrBack.empty()) {
+      log() << "hotswap: error: emitReplacementFallback: branch-back "
+            << "encoding failed for sled at 0x" << utohexstr(Sled->WritePos)
+            << "\n";
+      return false;
+    }
+    std::memcpy(Text + Sled->WritePos + Replacement.size(), BrBack.data(),
+                BrBack.size());
+
+    SmallVector<uint8_t> BrFwd = LS.encodeSBranch(InstOffset, Sled->WritePos);
+    if (BrFwd.empty()) {
+      log() << "hotswap: error: emitReplacementFallback: branch-forward "
+            << "encoding failed at 0x" << utohexstr(InstOffset) << "\n";
+      return false;
+    }
+    std::memcpy(Text + InstOffset, BrFwd.data(), BrFwd.size());
+    for (uint32_t I = MinInstSize; I < InstSize; I += MinInstSize)
+      std::memcpy(Text + InstOffset + I, LS.SNopBytes.data(), MinInstSize);
+
+    Sled->WritePos += Replacement.size() + MinInstSize;
+    return true;
+  }
+
+  Trampoline T;
+  T.OriginalOffset = InstOffset;
+  T.OriginalSize = InstSize;
+  T.Bytes.insert(T.Bytes.end(), Replacement.begin(), Replacement.end());
+  T.Bytes.insert(T.Bytes.end(), MinInstSize, uint8_t{0});
+  OutTrampolines.emplace_back(std::move(T));
+  return true;
+}
+
 /// Emit \p Replacement for the instruction at [\p InstOffset,
-/// \p InstOffset + \p InstSize). Prefers an in-place NOP-sled rewrite when a
-/// reachable sled with sufficient headroom exists; otherwise falls back to a
-/// deferred trampoline.
+/// \p InstOffset + \p InstSize). Same-size replacements are written directly.
+/// Larger replacements are collected for the displacement pass; if that pass
+/// cannot prove safety, retargetCodeObjectB0A0 lowers the collected edits
+/// through emitReplacementFallback.
 [[nodiscard]] bool emitReplacementCode(PatchContext &Ctx, uint64_t InstOffset,
                                        uint32_t InstSize,
                                        ArrayRef<uint8_t> Replacement) {
-  // findNearestSled already enforces that the returned sled has at least
-  // `Needed` bytes of headroom, so a non-null result is sufficient to take
-  // the in-place path.
-  uint64_t Needed = Replacement.size() + MinInstSize;
-  if (NopSled *Sled = findNearestSled(Ctx.NopSleds, InstOffset, Needed))
-    return emitToNopSled(Ctx, *Sled, InstOffset, InstSize, Replacement);
-  return emitToTrampoline(Ctx, InstOffset, InstSize, Replacement);
+  if (Replacement.size() <= InstSize) {
+    RewriteRule Rule;
+    Rule.ReplaceBytes.assign(Replacement.begin(), Replacement.end());
+    return applyByteReplace(Rule, InstOffset, InstSize, Ctx.Text, Ctx.TextSize,
+                            Ctx.LS);
+  }
+
+  DisplacementEdit Edit;
+  Edit.Offset = InstOffset;
+  Edit.OriginalSize = InstSize;
+  Edit.ReplacementBytes.assign(Replacement.begin(), Replacement.end());
+  Edit.KernelName = Ctx.Elf.findKernelAtOffset(InstOffset);
+  Ctx.OutDisplacements.push_back(std::move(Edit));
+  return true;
 }
 
 // -- applyGfx1250B0toA0Rules --------------------------------------------------
@@ -329,7 +383,9 @@ static uint32_t runPerInstPass(uint32_t (*Fn)(PatchContext &, size_t),
 static uint32_t
 applyGfx1250B0toA0Rules(std::vector<InternalDecodedInst> &Decoded,
                         uint8_t *Text, uint64_t TextSize, const LLVMState &LS,
-                        std::vector<Trampoline> &OutTrampolines, ElfView &Elf,
+                        std::vector<Trampoline> &OutTrampolines,
+                        std::vector<DisplacementEdit> &OutDisplacements,
+                        ElfView &Elf,
                         std::vector<ScratchPatchInfo> &OutScratchPatches,
                         const RewriteConfig &Config) {
   uint32_t Patched = 0;
@@ -351,9 +407,10 @@ applyGfx1250B0toA0Rules(std::vector<InternalDecodedInst> &Decoded,
   }
 
   StringMap<KernelPatchStats> KernelStats;
-  PatchContext Ctx{Config,           Decoded, Text, TextSize, LS,
-                   OutTrampolines,   Sleds,   Elf,  Liveness, KernelStats,
-                   OutScratchPatches};
+  PatchContext Ctx{Config,           Decoded,          Text,
+                   TextSize,         LS,               OutTrampolines,
+                   OutDisplacements, Sleds,            Elf,
+                   Liveness,         KernelStats,      OutScratchPatches};
 
   const HotswapPatchVTable &VT = getHotswapPatchVTable();
 
@@ -520,6 +577,29 @@ static void runScratchVerification(WritableMemoryBuffer &OutBuf,
           << "scratch conflicts\n";
 }
 
+static bool lowerDisplacementsToFallback(
+    ArrayRef<DisplacementEdit> Edits, uint8_t *Text, uint64_t TextSize,
+    const LLVMState &LS, std::vector<NopSled> &Sleds,
+    std::vector<Trampoline> &OutTrampolines) {
+  bool Ok = true;
+  for (const DisplacementEdit &Edit : Edits) {
+    if (Edit.OriginalSize == 0)
+      continue;
+    if (Edit.ReplacementBytes.size() <= Edit.OriginalSize) {
+      RewriteRule Rule;
+      Rule.ReplaceBytes.assign(Edit.ReplacementBytes.begin(),
+                               Edit.ReplacementBytes.end());
+      Ok &= applyByteReplace(Rule, Edit.Offset, Edit.OriginalSize, Text,
+                             TextSize, LS);
+      continue;
+    }
+    Ok &= emitReplacementFallback(Text, TextSize, LS, Sleds, OutTrampolines,
+                                  Edit.Offset, Edit.OriginalSize,
+                                  Edit.ReplacementBytes);
+  }
+  return Ok;
+}
+
 // -- retargetCodeObjectB0A0 ---------------------------------------------------
 
 amd_comgr_status_t retargetCodeObjectB0A0(const void *ElfData, size_t ElfSize,
@@ -575,7 +655,9 @@ amd_comgr_status_t retargetCodeObjectB0A0(const void *ElfData, size_t ElfSize,
   uint8_t *Text = Elf.textData();
   uint32_t Count = 0;
   std::vector<Trampoline> Deferred;
+  std::vector<DisplacementEdit> Displacements;
   std::vector<ScratchPatchInfo> ScratchPatches;
+  std::vector<NopSled> FallbackSleds;
   if (Options.RunB0A0Patches) {
     std::vector<InternalDecodedInst> Decoded;
     if (!decodeTextSection(Text, Elf.textSize(), LS, Decoded)) {
@@ -584,30 +666,71 @@ amd_comgr_status_t retargetCodeObjectB0A0(const void *ElfData, size_t ElfSize,
       return AMD_COMGR_STATUS_ERROR;
     }
 
+    FallbackSleds = buildNopSledMap(Decoded, LS);
     Count = applyGfx1250B0toA0Rules(Decoded, Text, Elf.textSize(), LS, Deferred,
-                                    Elf, ScratchPatches, Config);
+                                    Displacements, Elf, ScratchPatches, Config);
     log() << "hotswap: applied " << Count << " B0-to-A0 patches\n";
   } else {
     log() << "hotswap: B0-to-A0 patches disabled for this rewrite\n";
   }
 
   std::unique_ptr<WritableMemoryBuffer> Result;
-  std::vector<Trampoline> Growth = Deferred;
-  if (!Deferred.empty()) {
-    if (!fixupTrampolineBranches(Deferred, Text, Elf.textSize(), LS))
-      log() << "hotswap: error: some trampolines could not be fixed up\n";
-    Growth = Deferred;
-  }
-
-  std::vector<KernelEntryTrampolineFixup> EntryFixups;
   if (Options.RunEntryTrampolines) {
     std::optional<uint32_t> EntryCount =
-        appendKernelEntryTrampolines(Elf, LS, Growth, EntryFixups);
+        collectKernelEntryDisplacements(Elf, LS, Displacements);
     if (!EntryCount)
       return AMD_COMGR_STATUS_ERROR;
     Count += *EntryCount;
   } else {
     log() << "hotswap: kernel-entry trampolines disabled for this rewrite\n";
+  }
+
+  bool UsedDisplacement = false;
+  if (!Displacements.empty()) {
+    std::string Reason;
+    Result = tryApplyTextDisplacementToNewBuffer(Elf, LS, Displacements,
+                                                 &Reason);
+    if (Result) {
+      UsedDisplacement = true;
+    } else {
+      log() << "hotswap: displacement unavailable: " << Reason
+            << "; falling back to trampoline\n";
+    }
+  }
+
+  std::vector<Trampoline> Growth = Deferred;
+  std::vector<KernelEntryTrampolineFixup> EntryFixups;
+  if (!UsedDisplacement) {
+    if (!Displacements.empty() &&
+        !lowerDisplacementsToFallback(Displacements, Text, Elf.textSize(), LS,
+                                      FallbackSleds, Growth))
+      log() << "hotswap: error: some displacement fallback edits could not be "
+            << "lowered to NOP sled/trampoline form\n";
+
+    if (!Growth.empty()) {
+      if (!fixupTrampolineBranches(Growth, Text, Elf.textSize(), LS))
+        log() << "hotswap: error: some trampolines could not be fixed up\n";
+    }
+
+    if (Options.RunEntryTrampolines) {
+      std::optional<uint32_t> EntryCount =
+          appendKernelEntryTrampolines(Elf, LS, Growth, EntryFixups);
+      if (!EntryCount)
+        return AMD_COMGR_STATUS_ERROR;
+      // collectKernelEntryDisplacements already counted direct entry edits.
+      if (!Displacements.empty() && *EntryCount > 0)
+        log() << "hotswap: entry displacement fallback installed "
+              << *EntryCount << " appended stub"
+              << (*EntryCount == 1 ? "" : "s") << "\n";
+    }
+  }
+
+  if (UsedDisplacement) {
+    if (!ScratchPatches.empty())
+      runScratchVerification(*Result, LS, ScratchPatches, Config.MaxVgprs);
+
+    Out = std::move(Result);
+    return AMD_COMGR_STATUS_SUCCESS;
   }
 
   if (!Growth.empty()) {

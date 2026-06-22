@@ -343,7 +343,7 @@ uint32_t patchCvtPkFp8F32(PatchContext &Ctx, size_t Idx) {
     return 0;
   }
 
-  if (!emitToTrampoline(Ctx, DI.Offset, DI.Size, ReplacementBytes))
+  if (!emitReplacementCode(Ctx, DI.Offset, DI.Size, ReplacementBytes))
     return 0;
 
   if (!SA.KernelName.empty()) {
@@ -522,7 +522,7 @@ uint32_t patchCvtSrFp8F32(PatchContext &Ctx, size_t Idx) {
     return 0;
   }
 
-  if (!emitToTrampoline(Ctx, DI.Offset, DI.Size, ReplacementBytes))
+  if (!emitReplacementCode(Ctx, DI.Offset, DI.Size, ReplacementBytes))
     return 0;
 
   if (!SA.KernelName.empty()) {
@@ -686,7 +686,7 @@ uint32_t patchCvtF32Fp8(PatchContext &Ctx, size_t Idx) {
     return 0;
   }
 
-  if (!emitToTrampoline(Ctx, DI.Offset, DI.Size, ReplacementBytes))
+  if (!emitReplacementCode(Ctx, DI.Offset, DI.Size, ReplacementBytes))
     return 0;
 
   if (!SA.KernelName.empty()) {

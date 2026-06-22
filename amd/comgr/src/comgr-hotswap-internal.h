@@ -59,6 +59,8 @@
 namespace COMGR {
 namespace hotswap {
 
+class ElfView;
+
 // -- Logging ------------------------------------------------------------------
 //
 // Single output stream for all hotswap diagnostics (errors, warnings, and
@@ -79,6 +81,52 @@ struct Trampoline {
   uint64_t OriginalOffset = 0;
   uint32_t OriginalSize = 0;
   llvm::SmallVector<uint8_t> Bytes;
+};
+
+struct DisplacementEdit {
+  uint64_t Offset = 0;
+  uint32_t OriginalSize = 0;
+  llvm::SmallVector<uint8_t> ReplacementBytes;
+  std::string KernelName;
+};
+
+enum class DisplacementMapBias {
+  BeforeInsertedBytes,
+  AfterInsertedBytes,
+};
+
+class DisplacementPlan {
+public:
+  static llvm::Expected<DisplacementPlan>
+  create(const ElfView &Elf, llvm::ArrayRef<DisplacementEdit> Edits);
+
+  llvm::ArrayRef<DisplacementEdit> edits() const { return Edits; }
+  uint64_t oldTextSize() const { return OldTextSize; }
+  uint64_t rawGrowth() const { return RawGrowth; }
+  uint64_t paddedGrowth() const { return PaddedGrowth; }
+  uint64_t newTextSize() const { return OldTextSize + RawGrowth; }
+  uint64_t paddedTextSize() const { return OldTextSize + PaddedGrowth; }
+  size_t newElfSize(size_t OldElfSize) const { return OldElfSize + PaddedGrowth; }
+
+  bool mapOffset(uint64_t OldOffset, DisplacementMapBias Bias,
+                 uint64_t &NewOffset) const;
+  bool rangeOverlapsReplacement(uint64_t OldOffset, uint64_t Size) const;
+
+  llvm::SmallVector<uint8_t>
+  buildText(llvm::ArrayRef<uint8_t> OldText,
+            llvm::ArrayRef<uint8_t> SNopBytes) const;
+
+private:
+  DisplacementPlan(uint64_t OldTextSize, uint64_t RawGrowth,
+                   uint64_t PaddedGrowth,
+                   std::vector<DisplacementEdit> Edits)
+      : OldTextSize(OldTextSize), RawGrowth(RawGrowth),
+        PaddedGrowth(PaddedGrowth), Edits(std::move(Edits)) {}
+
+  uint64_t OldTextSize = 0;
+  uint64_t RawGrowth = 0;
+  uint64_t PaddedGrowth = 0;
+  std::vector<DisplacementEdit> Edits;
 };
 
 // Kernel-entry stubs are appended as normal .text growth. Keep each entry on
@@ -581,6 +629,7 @@ struct PatchContext {
   uint64_t TextSize = 0;
   const LLVMState &LS;
   std::vector<Trampoline> &OutTrampolines;
+  std::vector<DisplacementEdit> &OutDisplacements;
   std::vector<NopSled> &NopSleds;
   ElfView &Elf;
   const LivenessInfo &Liveness;
@@ -596,6 +645,12 @@ struct PatchContext {
 [[nodiscard]] bool emitToTrampoline(PatchContext &Ctx, uint64_t InstOffset,
                                     uint32_t InstSize,
                                     llvm::ArrayRef<uint8_t> Replacement);
+[[nodiscard]] bool
+emitReplacementFallback(uint8_t *Text, uint64_t TextSize,
+                        const LLVMState &LS, std::vector<NopSled> &NopSleds,
+                        std::vector<Trampoline> &OutTrampolines,
+                        uint64_t InstOffset, uint32_t InstSize,
+                        llvm::ArrayRef<uint8_t> Replacement);
 [[nodiscard]] bool emitReplacementCode(PatchContext &Ctx, uint64_t InstOffset,
                                        uint32_t InstSize,
                                        llvm::ArrayRef<uint8_t> Replacement);
@@ -682,6 +737,18 @@ llvm::SmallVector<uint8_t> buildKernelEntryTrampoline(uint64_t StubVAddr,
 bool isKernelEntryTrampoline(llvm::ArrayRef<uint8_t> Bytes,
                              const LLVMState &LS);
 
+/// Structural matcher for the direct-displacement entry prefix
+/// (`global_wb; v_nop`) used before falling back to appended entry stubs.
+bool isKernelEntryDisplacementPrefix(llvm::ArrayRef<uint8_t> Bytes,
+                                     const LLVMState &LS);
+
+/// Queue one direct insertion of `global_wb; v_nop` at each kernel descriptor
+/// entry that does not already target either a direct entry prefix or an
+/// appended HotSwap entry stub.
+std::optional<uint32_t> collectKernelEntryDisplacements(
+    const ElfView &Elf, const LLVMState &LS,
+    std::vector<DisplacementEdit> &OutEdits);
+
 /// Append one entry stub per kernel descriptor that does not already target a
 /// HotSwap entry stub. The stubs are appended to \p Growth and descriptor
 /// rewrites are recorded in \p OutFixups for application after ELF growth.
@@ -694,6 +761,20 @@ std::optional<uint32_t> appendKernelEntryTrampolines(
 bool rewriteKernelEntryDescriptorOffsets(
     llvm::WritableMemoryBuffer &OutBuf, uint64_t OldTextSize,
     llvm::ArrayRef<KernelEntryTrampolineFixup> Fixups);
+
+/// Apply direct .text displacement into an already allocated output buffer.
+/// The buffer must be exactly DisplacementPlan::newElfSize(Elf.size()) bytes.
+/// On failure, \p Out is left unchanged.
+bool tryApplyTextDisplacement(const ElfView &Elf, const LLVMState &LS,
+                              llvm::ArrayRef<DisplacementEdit> Edits,
+                              llvm::WritableMemoryBuffer &Out,
+                              std::string *Reason = nullptr);
+
+/// Convenience allocator wrapper around tryApplyTextDisplacement.
+std::unique_ptr<llvm::WritableMemoryBuffer>
+tryApplyTextDisplacementToNewBuffer(const ElfView &Elf, const LLVMState &LS,
+                                    llvm::ArrayRef<DisplacementEdit> Edits,
+                                    std::string *Reason = nullptr);
 
 // -- Function declarations (GFX1250 hotswap policy layer) ---------------------
 

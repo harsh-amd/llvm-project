@@ -37,8 +37,8 @@
 
 // COM: With explicit B0->B0 stepping, the entry-trampoline flag must not
 // COM: accidentally enable B0-to-A0 instruction patches. The isfirst opcodes
-// COM: remain, while the kernel descriptor is still redirected through an
-// COM: appended entry stub.
+// COM: remain, while the entry workaround is inserted directly at the kernel
+// COM: entry.
 // RUN: AMD_COMGR_HOTSWAP_ENTRY_TRAMPOLINES=1 hotswap-rewrite %t.elf \
 // RUN:   amdgcn-amd-amdhsa--gfx1250:gfx1250-b0-specific+ \
 // RUN:   amdgcn-amd-amdhsa--gfx1250:gfx1250-b0-specific+ \
@@ -46,11 +46,14 @@
 // RUN:   | %FileCheck --check-prefix=B0B0-API %s
 // B0B0-API: RESULT: SUCCESS
 // RUN: %llvm-objdump -d %t.b0b0.elf | %FileCheck --check-prefix=B0B0 %s
-// B0B0: s_barrier_signal_isfirst -1
+// B0B0-LABEL: <test_barrier_isfirst>:
+// B0B0-NEXT: global_wb
+// B0B0-NEXT: v_nop
+// B0B0-NEXT: s_barrier_signal_isfirst -1
 // B0B0-NEXT: s_barrier_wait 0xffff
 // B0B0-NEXT: s_barrier_signal_isfirst -3
 // B0B0-NEXT: s_barrier_wait 0xfffd
-// B0B0: global_wb
+// B0B0-NEXT: s_endpgm
 
 .amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 .text

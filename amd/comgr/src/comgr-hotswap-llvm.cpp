@@ -26,6 +26,7 @@
 #include "llvm/MC/MCParser/MCAsmParser.h"
 #include "llvm/MC/MCParser/MCTargetAsmParser.h"
 #include "llvm/MC/MCStreamer.h"
+#include "llvm/MC/MCTargetOptions.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 
@@ -163,8 +164,9 @@ static SmallVector<MCInst, 2> parseAsmToMCInsts(StringRef AsmStr,
 
   std::unique_ptr<MCAsmParser> Parser(
       createMCAsmParser(*SrcMgr, *S.Ctx, Streamer, *S.MAI));
+  MCTargetOptions Options;
   std::unique_ptr<MCTargetAsmParser> TAP(
-      S.Target->createMCAsmParser(*S.STI, *Parser, *S.MCII));
+      S.Target->createMCAsmParser(*S.STI, *Parser, *S.MCII, Options));
   if (!TAP) {
     log() << "hotswap: error: parseAsmToMCInsts: createMCAsmParser returned "
           << "null for asm:\n    " << AsmStr << "\n";
@@ -254,7 +256,8 @@ LLVMState initLLVM(const TargetIdentifier &TI) {
     return S;
   }
 
-  S.Ctx = std::make_unique<MCContext>(TT, *S.MAI, *S.MRI, *S.STI);
+  S.Ctx = std::make_unique<MCContext>(TT, S.MAI.get(), S.MRI.get(),
+                                      S.STI.get());
   S.MOFI = std::make_unique<MCObjectFileInfo>();
   S.MOFI->initMCObjectFileInfo(*S.Ctx, false);
   S.Ctx->setObjectFileInfo(S.MOFI.get());

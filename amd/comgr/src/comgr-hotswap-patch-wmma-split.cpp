@@ -652,21 +652,19 @@ static uint32_t applyWmmaSplitPatchesImpl(PatchContext &Ctx, size_t Idx) {
   if (AsmLines.empty())
     return 0; // matched-but-failed (build*Asm rejected an unsupported modifier)
 
-  // Compute the trampoline's eventual .text offset so buildTrampoline can
-  // emit relative jumps. Same accumulation pattern as emitToTrampoline in
-  // b0a0.cpp.
-  uint64_t TrampTextOffset = Ctx.TextSize;
-  for (const Trampoline &T : Ctx.OutTrampolines)
-    TrampTextOffset += T.Bytes.size();
-
-  Trampoline T = buildTrampoline(AsmLines, DI.Offset, DI.Size, TrampTextOffset,
-                                 Ctx.LS);
-  if (T.Bytes.empty()) {
+  std::string AsmSource;
+  for (StringRef Line : AsmLines) {
+    AsmSource += Line;
+    AsmSource += '\n';
+  }
+  SmallVector<uint8_t> Replacement = assembleSingleInst(AsmSource, Ctx.LS);
+  if (Replacement.empty()) {
     log() << "hotswap: error: WMMA split: trampoline assembly failed for "
           << DI.Mnemonic << "\n";
     return 0; // matched-but-failed
   }
-  Ctx.OutTrampolines.push_back(std::move(T));
+  if (!emitReplacementCode(Ctx, DI.Offset, DI.Size, Replacement))
+    return 0; // matched-but-failed
 
   log() << "hotswap: WMMA split: patched " << DI.Mnemonic << " at offset 0x"
         << utohexstr(DI.Offset) << "\n";
