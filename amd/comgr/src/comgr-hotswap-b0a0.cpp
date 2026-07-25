@@ -3076,7 +3076,9 @@ static amd_comgr_status_t retargetCodeObjectImpl(
 
     if (!EntryDisplacements.empty()) {
       Expected<std::unique_ptr<WritableMemoryBuffer>> DisplacedOrErr =
-          tryApplyTextDisplacementToNewBuffer(Elf, LS, EntryDisplacements);
+          tryApplyTextDisplacementToNewBuffer(
+              Elf, LS, EntryDisplacements,
+              /*RelocateTrailingSections=*/true);
       if (DisplacedOrErr) {
         std::unique_ptr<WritableMemoryBuffer> Displaced =
             std::move(*DisplacedOrErr);
@@ -3147,8 +3149,9 @@ static amd_comgr_status_t retargetCodeObjectImpl(
       log() << "hotswap: transactional displacement: collected "
             << TransactionalDisplacements.size() << " growing edit(s)\n";
       Expected<std::unique_ptr<WritableMemoryBuffer>> GrownOrErr =
-          tryApplyTextDisplacementToNewBuffer(Elf, LS,
-                                              TransactionalDisplacements);
+          tryApplyTextDisplacementToNewBuffer(
+              Elf, LS, TransactionalDisplacements,
+              /*RelocateTrailingSections=*/true);
       if (!GrownOrErr) {
         std::string Reason = toString(GrownOrErr.takeError());
         log() << "hotswap: transactional displacement declined: " << Reason
