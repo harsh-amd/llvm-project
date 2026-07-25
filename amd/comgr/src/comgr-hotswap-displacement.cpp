@@ -537,7 +537,7 @@ Error validateTrailingRelocationLayout(const ElfView &Elf) {
   return Error::success();
 }
 
-+/// Linked-ELF proof object for an indirect dispatch table. Every nonzero slot
+/// Linked-ELF proof object for an indirect dispatch table. Every nonzero slot
 /// must have one symbol-less RELATIVE64 relocation into .text; any other
 /// contents make the candidate ineligible.
 struct RelocationTableCandidate {
