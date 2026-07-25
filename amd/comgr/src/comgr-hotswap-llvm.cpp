@@ -486,38 +486,6 @@ SmallVector<uint8_t> LLVMState::encodeSBranch(uint64_t FromOffset,
 
 // -- Instruction decode -------------------------------------------------------
 
-bool hasValidMCRegisterOperands(const MCInst &Inst, const LLVMState &LS) {
-  if (!LS.MCII || !LS.MRI || !LS.STI ||
-      Inst.getOpcode() >= LS.MCII->getNumOpcodes())
-    return false;
-
-  const MCInstrDesc &Desc = LS.MCII->get(Inst.getOpcode());
-  const ArrayRef<MCOperandInfo> OperandInfos = Desc.operands();
-  const unsigned HwMode = LS.STI->getHwMode(MCSubtargetInfo::HwMode_RegInfo);
-  for (unsigned I = 0; I != Inst.getNumOperands(); ++I) {
-    const MCOperand &Operand = Inst.getOperand(I);
-    if (!Operand.isReg() || !Operand.getReg())
-      continue;
-
-    const MCRegister Register(Operand.getReg());
-    if (Register.id() >= LS.MRI->getNumRegs())
-      return false;
-    if (I >= OperandInfos.size())
-      continue;
-
-    const MCOperandInfo &OperandInfo = OperandInfos[I];
-    if (OperandInfo.OperandType != MCOI::OPERAND_REGISTER)
-      continue;
-    const int16_t RegisterClass = LS.MCII->getOpRegClassID(OperandInfo, HwMode);
-    if (RegisterClass < 0)
-      continue;
-    if (static_cast<unsigned>(RegisterClass) >= LS.MRI->getNumRegClasses() ||
-        !LS.MRI->getRegClass(RegisterClass).contains(Register))
-      return false;
-  }
-  return true;
-}
-
 InstructionDecoder::InstructionDecoder(const uint8_t *Text, uint64_t TextSize,
                                        const LLVMState &LS, bool WantMnemonic)
     : Text(Text), TextSize(TextSize), LS(LS), WantMnemonic(WantMnemonic) {}
@@ -586,11 +554,6 @@ bool InstructionDecoder::decode(
     // COMGR byte predecoder would duplicate the generated decoder tables.
     MCDisassembler::DecodeStatus Status =
         LS.MCD->getInstruction(DI.Inst, InstSize, DecodeBytes, Pos, nulls());
-    if (Status != MCDisassembler::Fail &&
-        !hasValidMCRegisterOperands(DI.Inst, LS)) {
-      Status = MCDisassembler::Fail;
-      DI.Inst = MCInst();
-    }
     if (Status != MCDisassembler::Fail && InstSize > RemainingBytes.size()) {
       Status = MCDisassembler::Fail;
       DI.Inst = MCInst();

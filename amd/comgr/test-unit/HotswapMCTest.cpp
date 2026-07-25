@@ -6723,30 +6723,3 @@ TEST(DecodeStreaming, TruncatedLiteralFailsClosed) {
   EXPECT_EQ(Decoded[0].Size, MinInstSize);
   EXPECT_EQ(Decoded[0].Mnemonic, "<unknown>");
 }
-
-TEST(DecodeStreaming, ValidatesDecodedRegisterClasses) {
-  LLVMState S = initLLVM(makeGfx1250Ident());
-  ASSERT_TRUE(S.Valid);
-
-  llvm::SmallVector<uint8_t> Bytes =
-      assembleSingleInst("v_mov_b32 v240, s2", S);
-  ASSERT_FALSE(Bytes.empty());
-  std::vector<InternalDecodedInst> Decoded;
-  ASSERT_TRUE(decodeTextSection(Bytes.data(), Bytes.size(), S, Decoded));
-  ASSERT_EQ(Decoded.size(), 1u);
-  ASSERT_TRUE(Decoded[0].DecodeSucceeded);
-  EXPECT_TRUE(hasValidMCRegisterOperands(Decoded[0].Inst, S));
-
-  llvm::MCInst WrongClass = Decoded[0].Inst;
-  ASSERT_TRUE(S.SCCRegister.isValid());
-  WrongClass.getOperand(0).setReg(S.SCCRegister);
-  EXPECT_FALSE(hasValidMCRegisterOperands(WrongClass, S));
-
-  llvm::MCInst OutOfRange = Decoded[0].Inst;
-  OutOfRange.getOperand(0).setReg(llvm::MCRegister(S.MRI->getNumRegs()));
-  EXPECT_FALSE(hasValidMCRegisterOperands(OutOfRange, S));
-
-  llvm::MCInst UnknownOpcode = Decoded[0].Inst;
-  UnknownOpcode.setOpcode(S.MCII->getNumOpcodes());
-  EXPECT_FALSE(hasValidMCRegisterOperands(UnknownOpcode, S));
-}
