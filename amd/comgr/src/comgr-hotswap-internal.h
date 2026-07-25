@@ -934,6 +934,13 @@ struct InternalDecodedInst {
   bool DecodeSucceeded = false;
 };
 
+/// Return whether every explicit register operand in \p Inst belongs to the
+/// TableGen register class selected by its instruction descriptor and active
+/// hardware mode. This catches malformed encodings that a release
+/// disassembler can otherwise surface as structurally invalid MCInsts.
+[[nodiscard]] bool hasValidMCRegisterOperands(const llvm::MCInst &Inst,
+                                              const LLVMState &LS);
+
 /// Stateful, bounded-memory instruction decoder shared by streaming and
 /// materialized HotSwap consumers. Successful byte-identical decode windows
 /// are cached, but the cache never grows beyond this fixed entry count.
